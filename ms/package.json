@@ -1,0 +1,41 @@
+{
+  "name": "windfall-minesweeper",
+  "version": "2.0.0",
+  "description": "Zero-dependency Node.js port of the Minesweeper (Classic) server, solver, admin and analysis tooling (replaces the Python server/bot/tools/admin).",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.5"
+  },
+  "exports": {
+    "./core/sim-engine": "./core/sim-engine.js",
+    "./core/solver": "./core/solver.js",
+    "./core/client": "./core/client.js",
+    "./core/mt19937": "./core/mt19937.js",
+    "./sim-server/server": "./sim-server/server.js",
+    "./sim-server/selfcheck": "./sim-server/selfcheck.js",
+    "./analyze/analyze-ref": "./analyze/analyze-ref.js",
+    "./analyze/analyze-diff": "./analyze/analyze-diff.js",
+    "./bot/bench": "./bot/bench.js",
+    "./bot/fastest": "./bot/fastest.js",
+    "./bot/smoke": "./bot/smoke.js",
+    "./bot/profile": "./bot/profile.js",
+    "./cli/ms_analyze": "./cli/ms_analyze.js",
+    "./cli/verify-parity": "./cli/verify-parity.js"
+  },
+  "bin": {
+    "ms-analyze": "./cli/ms_analyze.js",
+    "ms-bench": "./bot/bench.js",
+    "ms-fastest": "./bot/fastest.js",
+    "ms-smoke": "./bot/smoke.js",
+    "ms-profile": "./bot/profile.js",
+    "ms-verify-parity": "./cli/verify-parity.js",
+    "ms-analyze-diff": "./analyze/analyze-diff.js",
+    "ms-admin": "./admin/admin.js",
+    "ms-server": "./sim-server/server.js"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "parity": "node tools/parity-all.js"
+  }
+}

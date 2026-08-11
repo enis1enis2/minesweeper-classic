@@ -1,0 +1,234 @@
+#include <windows.h>
+#include "resource.h"
+
+IDR_MANIFEST RT_MANIFEST "app.manifest"
+
+IDI_MAIN ICON "minesweeper.ico"
+
+IDR_MENU MENU
+BEGIN
+    POPUP "&Game"
+    BEGIN
+        MENUITEM "&New\tF2",                IDM_NEW
+        MENUITEM SEPARATOR
+        MENUITEM "&Beginner",               IDM_BEGIN
+        MENUITEM "&Intermediate",           IDM_INTERMEDIATE
+        MENUITEM "E&xpert",                 IDM_EXPERT
+        MENUITEM "&Custom...",              IDM_CUSTOM
+        MENUITEM "&Seeds...",               IDM_SEEDS
+        MENUITEM "&Scenario Probabilities...", IDM_SCENARIOS
+        POPUP "Hall of &Fame"
+        BEGIN
+            MENUITEM "&Player...",             IDM_HOF_PLAYER
+            MENUITEM "&View Leaderboard...",   IDM_HOF_VIEW
+            MENUITEM SEPARATOR
+            MENUITEM "&Auto-submit best times", IDM_HOF_AUTO
+        END
+        MENUITEM SEPARATOR
+        MENUITEM "&Marks (?)",              IDM_MARKS
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit",                   IDM_EXIT
+    END
+    POPUP "&Settings"
+    BEGIN
+        MENUITEM "&Privacy...",             IDM_PRIVACY
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&About Minesweeper...",   IDM_ABOUT
+    END
+END
+
+IDD_CUSTOM DIALOGEX 0, 0, 200, 80
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Custom Board"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "&Height:",       IDC_STATIC, 8, 10, 40, 8
+    EDITTEXT        IDC_ROWS,        52, 8, 40, 12, ES_AUTOHSCROLL
+    LTEXT           "&Width:",        IDC_STATIC, 100, 10, 34, 8
+    EDITTEXT        IDC_COLS,        126, 8, 38, 12, ES_AUTOHSCROLL
+    LTEXT           "&Mines:",        IDC_STATIC, 8, 28, 40, 8
+    EDITTEXT        IDC_MINES,       52, 26, 40, 12, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK",             IDOK, 52, 52, 44, 14
+    PUSHBUTTON      "Cancel",         IDCANCEL, 106, 52, 44, 14
+END
+
+/* Per-difficulty board seeds. Every row: Off/Normal/Custom radios, a value
+ * field and a live label with the resolved board seed. */
+IDD_SEEDS DIALOGEX 0, 0, 256, 172
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Seeds"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Per-difficulty board seeds. Normal uses the number as-is; Custom hashes text with the difficulty folded in.",
+                    IDC_STATIC, 8, 6, 240, 14
+    LTEXT           "&Beginner",      IDC_STATIC, 8, 24, 46, 8
+    CONTROL         "O&ff",           IDC_SEED_OFF_BEGIN,    "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 56, 22, 28, 10
+    CONTROL         "&Normal",        IDC_SEED_NORMAL_BEGIN, "Button", BS_AUTORADIOBUTTON, 88, 22, 42, 10
+    CONTROL         "&Custom",        IDC_SEED_CUSTOM_BEGIN, "Button", BS_AUTORADIOBUTTON, 132, 22, 42, 10
+    EDITTEXT        IDC_SEED_VALUE_BEGIN,  56, 34, 100, 12, ES_AUTOHSCROLL | WS_DISABLED
+    LTEXT           "",               IDC_SEED_RESULT_BEGIN, 160, 36, 88, 8, SS_ENDELLIPSIS
+
+    LTEXT           "&Intermediate",  IDC_STATIC, 8, 54, 46, 8
+    CONTROL         "O&ff",           IDC_SEED_OFF_BEGIN + IDC_SEED_ROW_STRIDE,    "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 56, 52, 28, 10
+    CONTROL         "&Normal",        IDC_SEED_NORMAL_BEGIN + IDC_SEED_ROW_STRIDE, "Button", BS_AUTORADIOBUTTON, 88, 52, 42, 10
+    CONTROL         "&Custom",        IDC_SEED_CUSTOM_BEGIN + IDC_SEED_ROW_STRIDE, "Button", BS_AUTORADIOBUTTON, 132, 52, 42, 10
+    EDITTEXT        IDC_SEED_VALUE_BEGIN + IDC_SEED_ROW_STRIDE,  56, 64, 100, 12, ES_AUTOHSCROLL | WS_DISABLED
+    LTEXT           "",               IDC_SEED_RESULT_BEGIN + IDC_SEED_ROW_STRIDE, 160, 66, 88, 8, SS_ENDELLIPSIS
+
+    LTEXT           "E&xpert",        IDC_STATIC, 8, 84, 46, 8
+    CONTROL         "O&ff",           IDC_SEED_OFF_BEGIN + 2 * IDC_SEED_ROW_STRIDE,    "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 56, 82, 28, 10
+    CONTROL         "&Normal",        IDC_SEED_NORMAL_BEGIN + 2 * IDC_SEED_ROW_STRIDE, "Button", BS_AUTORADIOBUTTON, 88, 82, 42, 10
+    CONTROL         "&Custom",        IDC_SEED_CUSTOM_BEGIN + 2 * IDC_SEED_ROW_STRIDE, "Button", BS_AUTORADIOBUTTON, 132, 82, 42, 10
+    EDITTEXT        IDC_SEED_VALUE_BEGIN + 2 * IDC_SEED_ROW_STRIDE,  56, 94, 100, 12, ES_AUTOHSCROLL | WS_DISABLED
+    LTEXT           "",               IDC_SEED_RESULT_BEGIN + 2 * IDC_SEED_ROW_STRIDE, 160, 96, 88, 8, SS_ENDELLIPSIS
+
+    LTEXT           "&Custom",        IDC_STATIC, 8, 114, 46, 8
+    CONTROL         "O&ff",           IDC_SEED_OFF_BEGIN + 3 * IDC_SEED_ROW_STRIDE,    "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 56, 112, 28, 10
+    CONTROL         "&Normal",        IDC_SEED_NORMAL_BEGIN + 3 * IDC_SEED_ROW_STRIDE, "Button", BS_AUTORADIOBUTTON, 88, 112, 42, 10
+    CONTROL         "&Custom",        IDC_SEED_CUSTOM_BEGIN + 3 * IDC_SEED_ROW_STRIDE, "Button", BS_AUTORADIOBUTTON, 132, 112, 42, 10
+    EDITTEXT        IDC_SEED_VALUE_BEGIN + 3 * IDC_SEED_ROW_STRIDE,  56, 124, 100, 12, ES_AUTOHSCROLL | WS_DISABLED
+    LTEXT           "",               IDC_SEED_RESULT_BEGIN + 3 * IDC_SEED_ROW_STRIDE, 160, 126, 88, 8, SS_ENDELLIPSIS
+
+    DEFPUSHBUTTON   "OK",             IDOK, 70, 150, 44, 14
+    PUSHBUTTON      "Cancel",         IDCANCEL, 124, 150, 44, 14
+END
+
+/* Ask whether a committed custom seed should also be simulated on the remote
+ * telemetry server (Yes=once, Multi Sim=replay N times, Until Loss=replay
+ * until a loss is seen, No=skip). */
+IDD_REMSIM DIALOGEX 0, 0, 252, 116
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Remote Simulation"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "",               IDC_REMSIM_MSG, 8, 8, 236, 26, SS_ENDELLIPSIS
+    DEFPUSHBUTTON   "&Sim (once)",    IDYES, 12, 46, 68, 14
+    PUSHBUTTON      "&Multi Sim",     IDC_REMSIM_MULTI, 88, 46, 68, 14
+    PUSHBUTTON      "&No",            IDCANCEL, 164, 46, 68, 14
+    PUSHBUTTON      "Sim &Until Loss", IDC_REMSIM_UNTIL, 12, 64, 220, 14
+    LTEXT           "Until Loss replays the seed (capped at 10000 runs) until "
+                    "the simulated player loses, exposing the seed's risk profile.",
+                    IDC_STATIC, 12, 82, 228, 24
+END
+
+/* Live per-cell probability snapshot of the current board: safest move first,
+ * with the loss chance and the number of cells each click would open. */
+IDD_SCENARIO DIALOGEX 0, 0, 330, 260
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Scenario Probabilities"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "",               IDC_SCEN_INFO, 8, 6, 314, 18
+    LTEXT           "Safest move first: each click either reveals the cell "
+                    "(safe) or hits a mine (loss).", IDC_STATIC, 8, 26, 314, 8
+    LISTBOX         IDC_SCEN_LIST, 8, 36, 314, 204, LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "Close",          IDCANCEL, 262, 242, 60, 14
+END
+
+/* Opt-out for device diagnostics. The checkbox reflects the persisted
+ * [diagnostics] opt_out flag; OK commits, Cancel keeps the previous state. */
+IDD_PRIVACY DIALOGEX 0, 0, 280, 132
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Privacy"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    AUTOCHECKBOX   "&Send device diagnostics", IDC_PRIV_DIAG, 8, 8, 264, 10
+    LTEXT          "When enabled, Minesweeper collects a fixed set of device "
+                   "descriptors - OS version/build, CPU model and core count, "
+                   "GPU model, RAM total, screen resolution/refresh, game "
+                   "version, session uptime, and crash logs (sanitized) - and "
+                   "sends them to the diagnostics server over TLS, where they "
+                   "are encrypted at rest.",
+                   IDC_STATIC, 8, 24, 264, 44
+    LTEXT          "Nothing else is collected: no files, browsing, "
+                   "credentials, keystrokes, clipboard, screenshots, software "
+                   "inventory or personal identifiers.",
+                   IDC_STATIC, 8, 72, 264, 22
+    DEFPUSHBUTTON  "OK",              IDOK, 90, 108, 44, 14
+    PUSHBUTTON     "Cancel",          IDCANCEL, 146, 108, 44, 14
+END
+
+/* Dismissible disclosure banner, shown once at the first successful
+ * telemetry connect while diagnostics are enabled. */
+IDD_DIAG_BANNER DIALOGEX 0, 0, 300, 150
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Device diagnostics"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT          "Minesweeper sends device diagnostics (OS version, CPU, "
+                   "GPU, RAM, display, game version, session uptime and "
+                   "sanitized crash logs) over TLS to "
+                   "admin.jellyfiner.dpdns.org, where they are encrypted at "
+                   "rest. Nothing else is collected.",
+                   IDC_STATIC, 8, 10, 284, 56
+    LTEXT          "You can disable this anytime under Settings > Privacy, "
+                   "or by setting diagnostics_opt_out=1 in minesweeper.ini.",
+                   IDC_STATIC, 8, 70, 284, 22
+    DEFPUSHBUTTON  "&Got it",         IDOK, 112, 118, 76, 14
+END
+
+/* Player-name chooser: an alias shown on the Hall of Fame leaderboard.
+ * Stored in [leaderboard] name= of minesweeper.ini. */
+IDD_PLAYER DIALOGEX 0, 0, 220, 76
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Player Name"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT          "Name (letters, digits, - _; max 16):",
+                   IDC_STATIC, 8, 10, 204, 20
+    EDITTEXT       IDC_PLAYER_NAME, 8, 32, 204, 13, ES_AUTOHSCROLL
+    DEFPUSHBUTTON  "&OK",             IDC_PLAYER_OK, 54, 54, 48, 14
+    PUSHBUTTON     "&Cancel",         IDCANCEL, 118, 54, 48, 14
+END
+
+/* Hall of Fame: leaderboard of the fastest wins per name+difficulty, with
+ * an all/difficulty filter and a live status line. */
+IDD_HOF DIALOGEX 0, 0, 320, 224
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Hall of Fame"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT          "&Show:",           IDC_STATIC, 8, 10, 32, 8
+    COMBOBOX       IDC_HOF_FILTER, 44, 8, 92, 60, CBS_DROPDOWNLIST |
+                   WS_VSCROLL | WS_TABSTOP
+    LTEXT          "Best time per name and difficulty. "
+                   "&Auto-submit best times must be on to rank.",
+                   IDC_STATIC, 8, 26, 304, 14
+    CONTROL        "Place | Name | Board | Time", IDC_HOF_LIST,
+                   "SysListView32", LVS_REPORT | LVS_SINGLESEL |
+                   LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER |
+                   WS_TABSTOP, 8, 42, 304, 140
+    PUSHBUTTON     "&Refresh",         IDC_HOF_SUBMIT, 152, 196, 52, 14
+    DEFPUSHBUTTON  "&Close",           IDOK, 210, 196, 52, 14
+    LTEXT          "",                 IDC_HOF_STATUS, 8, 198, 138, 12
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Windfall"
+            VALUE "FileDescription", "Minesweeper (Classic)"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "minesweeper"
+            VALUE "OriginalFilename", "minesweeper.exe"
+            VALUE "ProductName", "Minesweeper (Classic)"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

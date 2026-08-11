@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+release/
+
+# Runtime / local config
+*.log
+minesweeper.ini
+crash-last.txt
+diag_err.txt
+diag_test_err.txt
+*.o
+*.exe
+*.ico
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node
+node_modules/
+
+# Internal / operational documents (not for distribution)
+memory-bank.md
+PROJECT_REPORT.md
+dbg-solver.mjs
+InstallationLog.txt
+
+# Ops-only scripts that reference production servers/credentials
+ms/tools/restart-headless.sh
+ms/tools/remote-test.sh
+ms/tools/bench-host.sh
+ms/tools/x11check.sh
+
+# Stale scratch files
+tools/compile_test.cmd
+tools/gcc.log
