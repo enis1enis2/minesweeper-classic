@@ -60,7 +60,7 @@ jobs:
           make
           cp minesweeper "../minesweeper-linux-${{ matrix.image }}"
       - name: Smoke test
-        run: "./minesweeper-linux-${{ matrix.image }}" --help >/dev/null
+        run: ./minesweeper-linux-${{ matrix.image }} --help >/dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.image }}
@@ -94,7 +94,7 @@ jobs:
              ms_core.c ms_net.c ms_sha256.c ms_ini.c ms_term.c ms_main.c \
              ms_x11_stub.c ../src/analyze.c -lpthread -lm
       - name: Smoke test
-        run: "./minesweeper-macos-${{ matrix.image }}" --help >/dev/null
+        run: ./minesweeper-macos-${{ matrix.image }} --help >/dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.image }}
