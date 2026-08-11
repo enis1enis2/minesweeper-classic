@@ -2,7 +2,7 @@
 rem build.cmd - builds both 32-bit and 64-bit releases of Minesweeper (Classic)
 rem Requires MSYS2 with mingw-w64 gcc toolchains. Set MSYS2_ROOT below.
 
-set MSYS2_ROOT=C:\Users\Enis Polat\scoop\apps\msys2\current
+if "%MSYS2_ROOT%"=="" set MSYS2_ROOT=C:\Users\Enis Polat\scoop\apps\msys2\current
 
 set ROOT=%~dp0
 set BUILD=%ROOT%build

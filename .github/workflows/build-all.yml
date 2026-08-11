@@ -1,0 +1,122 @@
+name: build-all
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows (x64 + x86)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-i686-gcc
+            mingw-w64-i686-binutils
+      - name: Build
+        shell: cmd
+        env:
+          MSYS2_ROOT: C:\msys64
+        run: build.cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            build/minesweeper-x64.exe
+            build/minesweeper-x86.exe
+          retention-days: 30
+
+  linux:
+    name: Linux (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-22.04, ubuntu-24.04, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: linux
+      - name: Install X11 static libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcb-dev libxdmcp-dev libxau-dev
+      - name: Build (static X11 client)
+        working-directory: linux
+        run: |
+          make
+          cp minesweeper "../minesweeper-linux-${{ matrix.image }}"
+      - name: Smoke test
+        run: "./minesweeper-linux-${{ matrix.image }}" --help >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.image }}
+          path: "minesweeper-linux-${{ matrix.image }}"
+          retention-days: 30
+
+  macos:
+    name: macOS (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-14, macos-15, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: linux
+      - name: Build (terminal + headless, no X11)
+        working-directory: linux
+        run: |
+          cat > ms_x11_stub.c <<'EOF'
+          /* stub so the terminal/headless build links without X11 */
+          int x11_main(void) {
+              fprintf(stderr, "x11 frontend not available in this build\n");
+              return 1;
+          }
+          EOF
+          cc -O2 -std=c11 -Wall -Wextra -pthread -I. -I../src \
+             -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L \
+             -o "../minesweeper-macos-${{ matrix.image }}" \
+             ms_core.c ms_net.c ms_sha256.c ms_ini.c ms_term.c ms_main.c \
+             ms_x11_stub.c ../src/analyze.c -lpthread -lm
+      - name: Smoke test
+        run: "./minesweeper-macos-${{ matrix.image }}" --help >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.image }}
+          path: "minesweeper-macos-${{ matrix.image }}"
+          retention-days: 30
+
+  release:
+    name: Assemble release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assemble release assets
+        run: |
+          mkdir -p out
+          mv dist/* out/
+          ls -la out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: false
