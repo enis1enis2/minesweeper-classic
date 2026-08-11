@@ -10,7 +10,6 @@ diag_err.txt
 diag_test_err.txt
 *.o
 *.exe
-*.ico
 
 # Python
 __pycache__/
