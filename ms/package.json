@@ -36,6 +36,7 @@
   },
   "scripts": {
     "test": "node --test \"test/*.test.js\"",
-    "parity": "node tools/parity-all.js"
+    "parity": "node tools/parity-all.js",
+    "backpressure": "node tools/backpressure-parity.js"
   }
 }

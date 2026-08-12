@@ -23,6 +23,13 @@ import { fileURLToPath } from "node:url";
 
 const MASK64 = (1n << 64n) - 1n;
 
+// A resolved seed of zero would leave xorshift64 stuck at zero forever (every
+// output step is x ^= (x << 13n) ^ (x >> 7n) ^ (x << 17n) with x === 0n), so
+// seed 0 is mapped onto a fixed nonzero constant.  This must stay identical to
+// minesweeper.c RNG_ZERO_SEED_FALLBACK and server/sim_engine.py
+// ZERO_SEED_FALLBACK.
+export const ZERO_SEED_FALLBACK = 0x9e3779b97f4a7c15n;
+
 // (rows, cols, mines) per difficulty, mirroring g_presets[].
 export const PRESETS = {
   beginner: [8, 8, 10],
@@ -39,7 +46,7 @@ export const DEFAULTS = {
 // The game's xorshift64, advanced in place (one value per call).
 export class Rng64 {
   constructor(seed) {
-    this.s = BigInt(seed) & MASK64;
+    this.s = toU64(seed);
   }
 
   next() {
@@ -66,9 +73,12 @@ function isBigInt(v) {
 }
 
 // A tiny bit of conversion glue: every public entry accepts either a Number
-// or a BigInt seed and normalises to BigInt (matching Python's `seed & MASK64`).
+// or a BigInt seed and normalises to BigInt (matching Python's `seed & MASK64`),
+// mapping a masked value of 0 onto ZERO_SEED_FALLBACK so xorshift64 never
+// collapses to the all-zero stream.
 function toU64(seed) {
-  return BigInt(seed) & MASK64;
+  const s = BigInt(seed) & MASK64;
+  return s === 0n ? ZERO_SEED_FALLBACK : s;
 }
 
 export class SimBoard {

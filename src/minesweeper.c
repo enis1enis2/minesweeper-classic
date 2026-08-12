@@ -193,6 +193,16 @@ static uint64_t xorshift(uint64_t *s) {
     return x;
 }
 
+/* A resolved seed of zero would leave xorshift64 stuck at zero forever (every
+   output step is x ^= x<<13 ^ x>>7 ^ x<<17 with x == 0), so seed 0 is mapped
+   onto a fixed nonzero constant.  This must stay identical in
+   server/sim_engine.py and ms/core/sim-engine.js (ZERO_SEED_FALLBACK). */
+#define RNG_ZERO_SEED_FALLBACK 0x9E3779B97F4A7C15ULL
+
+static uint64_t rng_seed_or_fallback(uint64_t seed) {
+    return seed != 0 ? seed : RNG_ZERO_SEED_FALLBACK;
+}
+
 /* ---------- board management ---------- */
 static void free_board(Game *g) {
     free(g->mine);      g->mine = NULL;
@@ -1676,7 +1686,7 @@ static void resolve_board_seed(int diff, uint64_t *out, int *seeded) {
     const SeedSlot *sl;
     *seeded = 0;
     if (g_seed_override) {
-        *out = g_seed_override_val;
+        *out = rng_seed_or_fallback(g_seed_override_val);
         g_seed_override = 0;
         *seeded = 1;
         return;
@@ -1684,12 +1694,12 @@ static void resolve_board_seed(int diff, uint64_t *out, int *seeded) {
     if (diff < 0 || diff >= DIFF_COUNT) return;
     sl = &g_diff_seeds[diff];
     if (sl->mode == SEED_NORMAL) {
-        *out = strtoull(sl->value, NULL, 10);
+        *out = rng_seed_or_fallback(strtoull(sl->value, NULL, 10));
         *seeded = 1;
     } else if (sl->mode == SEED_CUSTOM) {
         uint64_t v;
         if (diff_custom_seed_generate(diff, sl->value, &v, NULL, NULL)) {
-            *out = v;
+            *out = rng_seed_or_fallback(v);
             *seeded = 1;
         }
     }

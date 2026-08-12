@@ -31,6 +31,7 @@
  */
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -343,10 +344,10 @@ int scenario_analyze(int rows, int cols, int mines,
     out->cols = cols;
     out->total_cells = rows * cols;
     out->mines = mines;
-    strcpy(out->reason, "OK");
+    snprintf(out->reason, sizeof(out->reason), "OK");
 
     if (rows <= 0 || cols <= 0 || rows * cols > A_MAX_CELLS) {
-        strcpy(out->reason, "invalid board");
+        snprintf(out->reason, sizeof(out->reason), "invalid board");
         return 0;
     }
     a_rows = rows;
@@ -360,7 +361,7 @@ int scenario_analyze(int rows, int cols, int mines,
         if (a_hidden[i]) out->n_hidden++;
     }
     if (out->n_hidden == 0) {
-        strcpy(out->reason, "no hidden cells");
+        snprintf(out->reason, sizeof(out->reason), "no hidden cells");
         return 0;
     }
 
@@ -398,7 +399,7 @@ int scenario_analyze(int rows, int cols, int mines,
     in_frontier = malloc(sizeof(int) * a_n);
     if (!frontier || !in_frontier) {
         free(frontier); free(in_frontier);
-        strcpy(out->reason, "out of memory");
+        snprintf(out->reason, sizeof(out->reason), "out of memory");
         return 0;
     }
     for (i = 0; i < a_n; i++) { a_parent[i] = i; in_frontier[i] = 0; }
@@ -427,7 +428,7 @@ int scenario_analyze(int rows, int cols, int mines,
     if (!root_of || !comp_root || !comp_cells_ofs || !comp_cells) {
         free(frontier); free(in_frontier); free(root_of); free(comp_root);
         free(comp_cells_ofs); free(comp_cells);
-        strcpy(out->reason, "out of memory");
+        snprintf(out->reason, sizeof(out->reason), "out of memory");
         return 0;
     }
     ncomps = 0;
@@ -449,7 +450,7 @@ int scenario_analyze(int rows, int cols, int mines,
         if (!sizes) {
             free(frontier); free(in_frontier); free(root_of); free(comp_root);
             free(comp_cells_ofs); free(comp_cells);
-            strcpy(out->reason, "out of memory");
+            snprintf(out->reason, sizeof(out->reason), "out of memory");
             return 0;
         }
         for (i = 0; i < ncomps; i++) sizes[i] = 0;
@@ -520,7 +521,7 @@ int scenario_analyze(int rows, int cols, int mines,
         free(comp_cells_ofs); free(comp_cells);
         for (i = 0; i < ncomps; i++) { free(comps[i].S); free(comps[i].T); }
         free(comps); free(dists);
-        strcpy(out->reason, "out of memory");
+        snprintf(out->reason, sizeof(out->reason), "out of memory");
         return 0;
     }
 
@@ -532,7 +533,7 @@ int scenario_analyze(int rows, int cols, int mines,
             free(comp_cells_ofs); free(comp_cells);
             for (i = 0; i < ncomps; i++) { free(comps[i].S); free(comps[i].T); }
             free(comps); free(dists);
-            strcpy(out->reason, "out of memory");
+            snprintf(out->reason, sizeof(out->reason), "out of memory");
             return 0;
         }
         if (ncomps == 0) {
@@ -594,7 +595,7 @@ int scenario_analyze(int rows, int cols, int mines,
                     free(comps[i].S); free(comps[i].T);
                 }
                 free(comps); free(dists);
-                strcpy(out->reason, "out of memory");
+                snprintf(out->reason, sizeof(out->reason), "out of memory");
                 return 0;
             }
 
@@ -700,7 +701,7 @@ after_uniform:
             free(comp_cells_ofs); free(comp_cells);
             for (i = 0; i < ncomps; i++) { free(comps[i].S); free(comps[i].T); }
             free(comps); free(dists);
-            strcpy(out->reason, "out of memory");
+            snprintf(out->reason, sizeof(out->reason), "out of memory");
             return 0;
         }
         {
