@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["mscore", "mserver", "msapp", "msparity"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+mscore = { path = "mscore" }
+num-bigint = "0.4"
+num-traits = "0.2"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+hmac = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+scrypt = "0.11"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+eframe = "0.29"
+egui = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
