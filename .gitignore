@@ -2,6 +2,11 @@
 build/
 release/
 
+# Archived retired backend ports (Python server/bot, Node ms/) — moved 2026-08-13.
+# Files here remain tracked (moved via `git mv`); the ignore covers anything new
+# placed under archive/ (e.g. __pycache__, stray probe files).
+archive/
+
 # Runtime / local config
 *.log
 minesweeper.ini
@@ -26,10 +31,10 @@ dbg-solver.mjs
 InstallationLog.txt
 
 # Ops-only scripts that reference production servers/credentials
-ms/tools/restart-headless.sh
-ms/tools/remote-test.sh
-ms/tools/bench-host.sh
-ms/tools/x11check.sh
+archive/ms/tools/restart-headless.sh
+archive/ms/tools/remote-test.sh
+archive/ms/tools/bench-host.sh
+archive/ms/tools/x11check.sh
 
 # Stale scratch files
 tools/compile_test.cmd

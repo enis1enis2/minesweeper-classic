@@ -223,7 +223,7 @@ simulations, on top of the normal broadcast stream:
   and `requntil <diff> <n> [max]`.
 - **Difficulty batches** — `reqbatch <diff> <count>` asks for `count` random
   games at a difficulty, useful for win/loss analysis without touching a GUI.
-- The Python analysis client in `server/ms_analyze.py` drives both and
+- The Python analysis client in `archive/server/ms_analyze.py` drives both and
   reports win rate / average moves, guesses and time per difficulty.
 - Requested games are stored in `sim_games` with a `requester` column (the
   client address; `NULL` for broadcast games), so analysis data stays
@@ -257,9 +257,15 @@ END
 Security: the listener is bound to loopback only (`127.0.0.1`), so remote
 machines cannot connect. Without `--listen`, no socket is opened at all.
 
-## AI solver (minesweeper_bot/)
+> **Archive note (2026-08-13):** the Python backend (`archive/server/`,
+> `archive/minesweeper_bot/`) and the Node port (`archive/ms/`) are retired and
+> have been moved into `archive/`. They are kept as reference/parity oracles.
+> The **only active backend** is the Rust port in `ms-rs/` (production since
+> 2026-08-13: `mserver` on :28571, `msadmin` on :8444).
 
-The `minesweeper_bot/` folder contains Python solvers that drive the game
+## AI solver (archive/minesweeper_bot/)
+
+The `archive/minesweeper_bot/` folder contains Python solvers that drive the game
 through the scripting interface to find the strongest playing strategy per
 difficulty.
 
@@ -293,13 +299,13 @@ python minesweeper_bot\ms_bench.py --all --sweep --games 800 --port 31350
 python minesweeper_bot\ms_fastest.py --port 31350 --games 200 --difficulty all
 ```
 
-## Simulation / telemetry server (server/)
+## Simulation / telemetry server (archive/server/)
 
-`server/` contains a Linux headless simulation server that turns the solver
+`archive/server/` contains a Linux headless simulation server that turns the solver
 into a live feed of games, paired with the telemetry client in the game.
 
 ```
-server/
+archive/server/
   sim_engine.py      headless port of the C board generator + click rules
   ms_server.py       multithreaded TCP server: sim games, SQLite, API on 28571
   ms_analyze.py      win/loss analysis client (exact-seed replay, difficulty batches)
@@ -393,10 +399,11 @@ line are written to SQLite (`data/sim.db` by default): tables `sim_games`
 flags, frontier samples as JSON) and `client_metrics` (raw metric lines).
 
 **Deploy to a Debian/Ubuntu server** (the game's telemetry endpoint, e.g.
-`135.125.79.15:28571/tcp`):
+`135.125.79.15:28571/tcp`; this is the retired Python backend — the current
+production backend is the Rust port in `ms-rs/`):
 
 ```
-sudo bash server/deploy.sh
+sudo bash archive/server/deploy.sh
 systemctl enable --now minesweeper-sim
 ```
 
