@@ -7,12 +7,15 @@ use crate::db::{Database, now_sec};
 use futures::FutureExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, WriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
+/// The connection's write half, boxed so both plaintext and TLS streams share
+/// the same hub code (the socket type is erased once the stream is split).
+pub type ClientWriter = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
+
 pub struct Client {
-    pub writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+    pub writer: ClientWriter,
     pub last: i64,
     pub seeds: u64,
     pub outcomes: u64,
@@ -42,7 +45,7 @@ impl ClientHub {
         })
     }
 
-    pub async fn add(&self, addr: String, writer: Arc<Mutex<WriteHalf<TcpStream>>>) {
+    pub async fn add(&self, addr: String, writer: ClientWriter) {
         let now = now_sec();
         let cl = Client {
             writer,
@@ -170,7 +173,7 @@ impl ClientHub {
     }
 
     pub async fn broadcast(&self, line: &str) -> usize {
-        let targets: Vec<(String, Arc<Mutex<WriteHalf<TcpStream>>>)> = {
+        let targets: Vec<(String, ClientWriter)> = {
             let m = self.clients.lock().await;
             m.iter()
                 .filter(|(_, cl)| !cl.dead)

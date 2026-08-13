@@ -4,7 +4,7 @@
 use crate::config::{self, HEAVY_CPU_SECONDS, LB_MAX, LB_MAX_IPS, LB_WINDOW, MAX_AUTH_FAILS, MAX_LINE};
 use crate::crypto::{hmac_sha256_hex, timing_safe_eq};
 use crate::db::{Database, GameRow, now_sec};
-use crate::hub::{AdmissionGate, ClientHub, RequestWorkers};
+use crate::hub::{AdmissionGate, ClientHub, ClientWriter, RequestWorkers};
 use crate::worker_pool::WorkerPool;
 use crate::worker::Task;
 use futures::FutureExt;
@@ -13,8 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, WriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Python int(): base-10 decimal only (no scientific, hex or underscores).
@@ -571,9 +570,14 @@ async fn produce_one(server: &Server, rng: &Arc<TokioMutex<Mt19937>>) {
 
 /// Connection loop: accumulate bytes (latin1 -> U+FFFD), split on '\n', trim,
 /// and dispatch. Mirrors handleConn in protocol.js plus server.js sockets.
-pub async fn handle_conn(server: Arc<Server>, stream: TcpStream, addr: String) {
+/// Generic over the transport so both plaintext `TcpStream` and
+/// `TlsStream<TcpStream>` connections run through the same protocol code.
+pub async fn handle_conn<S>(server: Arc<Server>, stream: S, addr: String)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut read, write) = tokio::io::split(stream);
-    let writer: Arc<TokioMutex<WriteHalf<TcpStream>>> = Arc::new(TokioMutex::new(write));
+    let writer: ClientWriter = Arc::new(TokioMutex::new(Box::new(write)));
     server.hub.add(addr.clone(), writer).await;
     let mut buf: String = String::new();
     let mut chunk = [0u8; 8192];

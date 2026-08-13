@@ -72,6 +72,11 @@ pub struct Core {
     pub solver_user: String,
     pub solver_pass: String,
     pub telemetry_on: bool,
+    /// Use TLS for the telemetry link (`--tls`).
+    pub tls: bool,
+    /// Optional PEM CA bundle to trust in addition to the system roots
+    /// (`--tls-ca FILE`), e.g. a self-signed or private CA.
+    pub tls_ca: Option<String>,
     pub connected: bool,
     pub attempts: u64,
     pub seeds_recv: u64,
@@ -100,6 +105,8 @@ impl Core {
             solver_user: String::new(),
             solver_pass: String::new(),
             telemetry_on: true,
+            tls: false,
+            tls_ca: None,
             connected: false,
             attempts: 0,
             seeds_recv: 0,

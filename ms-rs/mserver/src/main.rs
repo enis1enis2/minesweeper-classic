@@ -5,6 +5,7 @@
 //!       [--rate 5] [--difficulty all|beginner|intermediate|expert]
 //!       [--seed 12345] [--max-request 10000] [--max-concurrent 1]
 //!       [--solver-user USER --solver-pass PASS | --solver-config FILE]
+//!       [--tls-port 28572 --tls-cert cert.pem --tls-key key.pem]
 //!   mserver --selfcheck
 
 mod config;
@@ -41,6 +42,9 @@ struct Args {
     solver_user: Option<String>,
     solver_pass: Option<String>,
     solver_config: Option<String>,
+    tls_port: Option<u16>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
 }
 
 fn parse_args() -> Result<Args, i32> {
@@ -55,6 +59,9 @@ fn parse_args() -> Result<Args, i32> {
     let mut solver_user: Option<String> = None;
     let mut solver_pass: Option<String> = None;
     let mut solver_config: Option<String> = None;
+    let mut tls_port: Option<String> = None;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
     let mut selfcheck = false;
     let mut help = false;
 
@@ -72,6 +79,9 @@ fn parse_args() -> Result<Args, i32> {
             "--solver-user" => solver_user = Some(args.next().unwrap_or_default()),
             "--solver-pass" => solver_pass = Some(args.next().unwrap_or_default()),
             "--solver-config" => solver_config = Some(args.next().unwrap_or_default()),
+            "--tls-port" => tls_port = Some(args.next().unwrap_or_default()),
+            "--tls-cert" => tls_cert = Some(args.next().unwrap_or_default()),
+            "--tls-key" => tls_key = Some(args.next().unwrap_or_default()),
             "--selfcheck" => selfcheck = true,
             "--help" | "-h" => help = true,
             other => {
@@ -142,6 +152,26 @@ fn parse_args() -> Result<Args, i32> {
         }
     }
 
+    // TLS is all-or-nothing: --tls-port/--tls-cert/--tls-key must be given
+    // together. The plaintext port stays active either way.
+    let tls_present = tls_port.is_some() || tls_cert.is_some() || tls_key.is_some();
+    if tls_present && !(tls_port.is_some() && tls_cert.is_some() && tls_key.is_some()) {
+        eprintln!(
+            "ms_server: error: --tls-port, --tls-cert and --tls-key must be given together"
+        );
+        return Err(2);
+    }
+    let tls_port_val: Option<u16> = match &tls_port {
+        Some(p) => {
+            if !int_val(p) || p.parse::<u16>().is_err() {
+                eprintln!("ms_server: error: invalid --tls-port value: '{}'", p);
+                return Err(2);
+            }
+            p.parse().ok()
+        }
+        None => None,
+    };
+
     Ok(Args {
         host,
         port: port.parse().unwrap(),
@@ -154,6 +184,9 @@ fn parse_args() -> Result<Args, i32> {
         solver_user,
         solver_pass,
         solver_config,
+        tls_port: tls_port_val,
+        tls_cert,
+        tls_key,
     })
 }
 
@@ -161,7 +194,8 @@ fn usage() {
     println!(
         "usage: mserver [--host HOST] [--port PORT] [--db FILE] [--rate G/S] \
 [--difficulty all|beginner|intermediate|expert] [--seed N] [--max-request N] \
-[--max-concurrent N] [--solver-user USER --solver-pass PASS | --solver-config FILE] [--selfcheck]"
+[--max-concurrent N] [--solver-user USER --solver-pass PASS | --solver-config FILE] \
+[--tls-port PORT --tls-cert CERT.pem --tls-key KEY.pem] [--selfcheck]"
     );
 }
 
@@ -260,6 +294,66 @@ async fn main() {
         if solver_enabled { "protected" } else { "disabled" }
     );
 
+    // Optional TLS listener (same wire protocol, encrypted). Plaintext port
+    // stays active so legacy C clients can keep connecting.
+    if let (Some(tls_port), Some(cert), Some(key)) = (&args.tls_port, &args.tls_cert, &args.tls_key) {
+        let tls_cfg = match load_tls_config(cert, key) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ms_server: error: TLS: {}", e);
+                server.stop.store(true, Ordering::SeqCst);
+                std::process::exit(1);
+            }
+        };
+        let tls_listener = match TcpListener::bind((args.host.as_str(), *tls_port)).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("ms_server: error: TLS listen: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let tls_bound = tls_listener.local_addr().unwrap().port();
+        println!("ms_server TLS listening on {}:{}", args.host, tls_bound);
+        let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)));
+        let tls_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop {
+                match tls_listener.accept().await {
+                    Ok((stream, peer)) => {
+                        let addr = fmt_peer(&peer);
+                        let srv = Arc::clone(&tls_server);
+                        let acc = Arc::clone(&acceptor);
+                        tokio::spawn(async move {
+                            let tls_stream = match acc.accept(stream).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    // A failed handshake (wrong protocol, bad
+                                    // cert, noise) must not affect the listener.
+                                    eprintln!("conn {}: TLS handshake failed: {}", addr, e);
+                                    return;
+                                }
+                            };
+                            // One panic in a connection's handler must never
+                            // take down the listener loop or other connections.
+                            if let Err(panic) =
+                                std::panic::AssertUnwindSafe(handle_conn(srv, tls_stream, addr.clone()))
+                                    .catch_unwind()
+                                    .await
+                            {
+                                eprintln!("conn {}: panic in TLS connection handler: {:?}", addr, panic);
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        if tls_server.stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     {
         let server2 = Arc::clone(&server);
         tokio::spawn(async move {
@@ -338,6 +432,27 @@ fn make_decision_rng(seed: Option<u64>) -> Mt19937 {
 
 fn fmt_peer(peer: &SocketAddr) -> String {
     format!("{}", peer)
+}
+
+/// Load a PEM certificate chain and PKCS#8/RSA/EC private key into a rustls
+/// server config. The key file must not be password-protected.
+fn load_tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, String> {
+    use std::io::BufReader;
+    let cert_bytes = std::fs::read(cert_path).map_err(|e| format!("read {}: {}", cert_path, e))?;
+    let key_bytes = std::fs::read(key_path).map_err(|e| format!("read {}: {}", key_path, e))?;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(&cert_bytes[..]))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parse {}: {}", cert_path, e))?;
+    if certs.is_empty() {
+        return Err(format!("no certificates found in {}", cert_path));
+    }
+    let key = rustls_pemfile::private_key(&mut BufReader::new(&key_bytes[..]))
+        .map_err(|e| format!("parse {}: {}", key_path, e))?
+        .ok_or_else(|| format!("no private key found in {}", key_path))?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("build config: {}", e))
 }
 
 /// `--selfcheck`: sanity-run one game per difficulty on a fixed seed and

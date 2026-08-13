@@ -24,23 +24,27 @@ untrusted input and on limiting what a network peer can forge or force.
 | C3 | Linux config shell injection | `linux/ms_ini.c::mkdirs_for_path` rewritten to POSIX `mkdir`/`_WIN32 _mkdir` with no `system()`/`popen()`; also fixed a latent read/write mismatch in `ms_ini_get_str`. |
 | C4 | `mserver` panic-free DB/network paths | All DB methods return `rusqlite::Result`; the connection mutex survives poisoning; client-writer races degrade gracefully (`let Some … else`); degraded paths reply with protocol-valid framing. |
 | C5 | Telemetry/session hygiene | Linux `telemetry on` restarts against the user-configured endpoint (not the hardcoded production host); verified msadmin sessions are in-memory only, never persisted; documented the plaintext telemetry stream and the `--no-telemetry` opt-out. |
+| C6 | Docs/tooling split | `SECURITY.md` threat model + accepted risks; internal docs moved out of the repo; `tools/README.md` documents the dev harnesses. |
+| C7 | TLS telemetry transport | `mserver` gained a native TLS listener (`--tls-port/--tls-cert/--tls-key`) and `msapp` a TLS client (`--tls`, `--tls-ca`); rustls terminates the same wire protocol, so seeds/metrics/leaderboard/`req*` are encrypted on the wire. Deployment (Let's Encrypt, Cloudflare, stunnel) is documented in `DEPLOYMENT.md`. Legacy C clients remain plaintext. |
 
 ## Known limitations (accepted)
 
 These are deliberate, documented constraints. Do not assume protections that
 are not listed here.
 
-- **The mserver protocol is plaintext TCP** — no TLS. Game metric lines,
-  leaderboard submissions and the seed stream are readable by anyone who can
-  observe the network path. The Windows device-diagnostics report is the
-  exception: it is delivered separately over HTTPS (`WinHTTP`,
-  `WINHTTP_FLAG_SECURE`).
+- **Plaintext telemetry remains the default and the only option for the C
+  clients.** TLS is available on the Rust path (`mserver --tls-*`, `msapp
+  --tls`) but must be explicitly enabled; the Win32 and Linux C clients have
+  no TLS stack and their wire traffic can be read by anyone observing the
+  network path (encrypt it with a local `stunnel` relay — see
+  `DEPLOYMENT.md`). The Windows device-diagnostics report is delivered
+  separately over HTTPS (`WinHTTP`, `WINHTTP_FLAG_SECURE`).
 - **The metric/outcome stream is unauthenticated.** Anyone who can reach an
   `mserver` can connect, stream seeds and inject metric lines. HMAC-SHA256
   challenge authentication covers only the `req*` solver-request path (see
-  `--solver-user` / `--solver-pass`). Adding authentication or per-message
-  integrity to the whole stream is a wire-format change and is **out of
-  scope** until explicitly requested.
+  `--solver-user` / `--solver-pass`). TLS encrypts the stream but does not
+  authenticate it; per-message integrity/HMAC beyond TLS is a wire-format
+  change and is **out of scope** until explicitly requested.
 - **Telemetry is on by default.** Clients connect to the configured endpoint
   on startup unless run with `--no-telemetry`.
 - **`msadmin` is HTTP, not HTTPS.** The login cookie is `HttpOnly; Secure;
@@ -66,8 +70,13 @@ are not listed here.
   secret) and `data/diag.key` (cookie encryption key) with filesystem
   permissions.
 - **`mserver`:** firewall it. Do not expose the protocol port beyond the
-  machines whose clients should participate, since the stream is plaintext
-  and the write path is unauthenticated.
+  machines whose clients should participate. For production prefer the TLS
+  listener (`--tls-port/--tls-cert/--tls-key`, public CA) and restrict the
+  plaintext port to the C-client/stunnel-relay subnets — see
+  `DEPLOYMENT.md`.
+- **Clients:** prefer `msapp --tls` against a TLS-terminated endpoint
+  (`--tls-ca FILE` for private CAs). The write path is unauthenticated even
+  over TLS, so still restrict who can reach the port.
 - **Linux client:** `--no-telemetry` and `--telemetry host:port` are
   supported identically to the Win32 client.
 

@@ -18,6 +18,8 @@ struct Cli {
     seed_args: Vec<(String, bool)>, // (arg, custom)
     telemetry_host: String,
     telemetry_port: u16, // 0 = off
+    tls: bool,
+    tls_ca: Option<String>,
     solver_user: Option<String>,
     solver_pass: Option<String>,
     solver_config: Option<String>,
@@ -31,6 +33,8 @@ impl Default for Cli {
             seed_args: Vec::new(),
             telemetry_host: host,
             telemetry_port: port,
+            tls: false,
+            tls_ca: None,
             solver_user: None,
             solver_pass: None,
             solver_config: None,
@@ -84,6 +88,14 @@ fn parse_cli() -> Cli {
             }
         } else if let Some(s) = a.strip_prefix("--telemetry=") {
             parse_telemetry_arg(s, &mut cli);
+        } else if a == "--tls" {
+            cli.tls = true;
+        } else if a == "--tls-ca" {
+            let mut v = None;
+            take_next(&mut i, &mut v);
+            cli.tls_ca = v;
+        } else if let Some(s) = a.strip_prefix("--tls-ca=") {
+            cli.tls_ca = Some(s.to_string());
         } else if a == "--solver-user" {
             let mut v = None;
             take_next(&mut i, &mut v);
@@ -176,6 +188,8 @@ fn main() -> eframe::Result {
         c.host = cli.telemetry_host.clone();
         c.port = cli.telemetry_port;
         c.telemetry_on = cli.telemetry_port != 0;
+        c.tls = cli.tls && cli.telemetry_port != 0;
+        c.tls_ca = cli.tls_ca.clone();
         c.solver_user = user.clone().unwrap_or_default();
         c.solver_pass = pass.clone().unwrap_or_default();
         for (arg, custom) in &cli.seed_args {

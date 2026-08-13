@@ -209,12 +209,18 @@ minesweeper-x64.exe --no-telemetry                # disable for this session
   soon as the request completes.
 - The game reports `metric` lines: game starts, wins/losses, click counts,
   and UI input latency (10 s periodic), so the server can log live play.
-- The link is **plaintext**: the mserver protocol has no TLS layer, so the
-  metric lines, leaderboard submissions and seed stream can be read by
-  anyone who can observe the network path. Device diagnostics (machine id,
-  OS/CPU/GPU/RAM, crash text) are a separate report and are delivered over
-  **HTTPS** only. To send nothing at all run with `--no-telemetry`, or point
-  the stream at your own server with `--telemetry host:port`.
+- The link is **plaintext by default**: the mserver protocol has no TLS layer
+  unless you enable it. The Rust server (`mserver`) can serve an **encrypted
+  TLS listener** (`--tls-port/--tls-cert/--tls-key`) and the Rust client
+  (`msapp`) connects with `--tls` (`--tls-ca FILE` for self-signed/private
+  certs) — see `DEPLOYMENT.md`. The legacy C clients (Win32 + Linux) always
+  speak plaintext; encrypt their wire with a local `stunnel` relay as
+  described there. Game metric lines, leaderboard submissions and the seed
+  stream are readable on the wire by anyone who can observe the network path
+  **when plaintext is used**. Device diagnostics (machine id, OS/CPU/GPU/RAM,
+  crash text) are a separate report and are delivered over **HTTPS** only. To
+  send nothing at all run with `--no-telemetry`, or point the stream at your
+  own server with `--telemetry host:port`.
 - Everything runs on a background thread; the UI never blocks on I/O, and
   with no server reachable the game simply keeps playing normally (it
   retries in the background).
@@ -420,6 +426,11 @@ systemctl enable --now minesweeper-sim
 `/opt/minesweeper-server`, creates a dedicated `msim` user with its data in
 `/var/lib/minesweeper-sim`, runs the self-check, installs the
 `minesweeper-sim` systemd unit, enables UFW and opens `28571/tcp`.
+
+> **TLS deployment:** the Rust server (`ms-rs/mserver`) can serve the same
+> protocol over an encrypted TLS listener (`--tls-port/--tls-cert/--tls-key`)
+> with the Rust client connecting via `--tls`. See `DEPLOYMENT.md` for
+> Let's Encrypt, Cloudflare and front-proxy setups.
 
 **UFW (allow client connections to the telemetry port):**
 

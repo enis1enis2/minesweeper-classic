@@ -11,9 +11,10 @@ use crate::engine::{EngineEvent, DIFF_NAMES};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::VecDeque;
+use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
@@ -23,6 +24,42 @@ const LOOP_TV_MS: u64 = 50;
 const BEAT_MS: u64 = 10_000;
 const RETRY_MS: u64 = 3_000;
 const AUTH_PREFIX: &str = "ms-auth:";
+
+/// Combined trait so the telemetry socket can be stored as one trait object
+/// that is both readable and writable (plaintext or TLS).
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncReadWrite for T {}
+
+/// The telemetry socket type, erased so the link code is identical for
+/// plaintext `TcpStream` and `TlsStream<TcpStream>`.
+type DynStream = Box<dyn AsyncReadWrite + Send>;
+
+/// rustls client config: system webpki roots, plus an optional PEM CA bundle
+/// (e.g. a self-signed or private CA) for `--tls-ca`.
+fn build_client_config(ca_path: Option<&str>) -> std::io::Result<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = ca_path {
+        let data = std::fs::read(path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("read {}: {}", path, e)))?;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut BufReader::new(&data[..]))
+                .collect::<Result<_, _>>()
+                .map_err(std::io::Error::other)?;
+        if certs.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "no PEM certificates found in {}",
+                path
+            )));
+        }
+        for c in certs {
+            roots.add(c).map_err(std::io::Error::other)?;
+        }
+    }
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
 
 pub enum OutMsg {
     Request(String),
@@ -69,7 +106,10 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-async fn read_line(buf: &mut Vec<u8>, stream: &mut TcpStream) -> std::io::Result<Option<String>> {
+async fn read_line<S>(buf: &mut Vec<u8>, stream: &mut S) -> std::io::Result<Option<String>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
     loop {
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -87,20 +127,20 @@ async fn read_line(buf: &mut Vec<u8>, stream: &mut TcpStream) -> std::io::Result
 
 struct LinkInner {
     core: Arc<Mutex<Core>>,
-    stream: Option<TcpStream>,
+    stream: Option<DynStream>,
     inbound: Vec<u8>,
     out_lines: VecDeque<String>,
     session: bool,
 }
 
 impl LinkInner {
-    async fn flush(&mut self, stream: &mut TcpStream) {
+    async fn flush(&mut self, stream: &mut DynStream) {
         let mut written = 0;
         while let Some(line) = self.out_lines.pop_front() {
             if line.starts_with("metric ") {
                 written += 1;
             }
-            if !write_all_checked(stream, &line).await {
+            if !write_all_checked(&mut **stream, &line).await {
                 self.out_lines.push_front(line);
                 break;
             }
@@ -111,7 +151,10 @@ impl LinkInner {
     }
 }
 
-async fn write_all_checked(stream: &mut TcpStream, line: &str) -> bool {
+async fn write_all_checked<S>(stream: &mut S, line: &str) -> bool
+where
+    S: AsyncWrite + Unpin + ?Sized,
+{
     stream.write_all(format!("{}\n", line).as_bytes()).await.is_ok()
 }
 
@@ -297,6 +340,26 @@ async fn run_task(core: Arc<Mutex<Core>>, mut rx: mpsc::UnboundedReceiver<OutMsg
     };
     let mut next_beat = std::time::Instant::now() + Duration::from_millis(BEAT_MS);
 
+    // Build the TLS connector once. If TLS was requested but the CA config is
+    // invalid, fail closed: disable the link rather than silently downgrading
+    // to plaintext.
+    let tls_connector: Option<tokio_rustls::TlsConnector> = {
+        let c = l.core.lock().unwrap();
+        if c.tls {
+            match build_client_config(c.tls_ca.as_deref()) {
+                Ok(cfg) => Some(tokio_rustls::TlsConnector::from(Arc::new(cfg))),
+                Err(e) => {
+                    eprintln!("msapp: TLS config error: {}; telemetry disabled", e);
+                    l.core.lock().unwrap().telemetry_on = false;
+                    l.core.lock().unwrap().connected = false;
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     loop {
         if !l.core.lock().unwrap().telemetry_on {
             sleep(Duration::from_millis(LOOP_TV_MS)).await;
@@ -310,13 +373,42 @@ async fn run_task(core: Arc<Mutex<Core>>, mut rx: mpsc::UnboundedReceiver<OutMsg
             };
             l.core.lock().unwrap().attempts += 1;
             match timeout(Duration::from_secs(CONNECT_TO), TcpStream::connect(&addr)).await {
-                Ok(Ok(mut s)) => {
+                Ok(Ok(s)) => {
                     let _ = s.set_nodelay(true);
-                    let (user, wanted) = {
+                    let (user, wanted, tls_host) = {
                         let c = l.core.lock().unwrap();
-                        (c.solver_user.clone(), c.solver_wanted())
+                        (c.solver_user.clone(), c.solver_wanted(), c.host.clone())
                     };
-                    if wanted && !write_all_checked(&mut s, &format!("auth {}", user)).await {
+                    let stream: DynStream = match &tls_connector {
+                        Some(conn) => {
+                            let server_name =
+                                match rustls::pki_types::ServerName::try_from(tls_host.clone()) {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        eprintln!("msapp: invalid TLS server name {:?}: {}", tls_host, e);
+                                        l.core.lock().unwrap().connected = false;
+                                        sleep(Duration::from_millis(RETRY_MS)).await;
+                                        continue;
+                                    }
+                                };
+                            match timeout(
+                                Duration::from_secs(CONNECT_TO),
+                                conn.connect(server_name, s),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls)) => Box::new(tls),
+                                _ => {
+                                    l.core.lock().unwrap().connected = false;
+                                    sleep(Duration::from_millis(RETRY_MS)).await;
+                                    continue;
+                                }
+                            }
+                        }
+                        None => Box::new(s),
+                    };
+                    let mut stream = stream;
+                    if wanted && !write_all_checked(&mut stream, &format!("auth {}", user)).await {
                         l.core.lock().unwrap().connected = false;
                         sleep(Duration::from_millis(RETRY_MS)).await;
                         continue;
@@ -325,8 +417,8 @@ async fn run_task(core: Arc<Mutex<Core>>, mut rx: mpsc::UnboundedReceiver<OutMsg
                     l.core.lock().unwrap().auth_state = if wanted { AUTH_WAIT_CHAL } else { AUTH_NONE };
                     l.core.lock().unwrap().sim_session = false;
                     l.session = false;
-                    l.flush(&mut s).await;
-                    l.stream = Some(s);
+                    l.flush(&mut stream).await;
+                    l.stream = Some(stream);
                 }
                 _ => {
                     l.core.lock().unwrap().connected = false;
@@ -341,7 +433,7 @@ async fn run_task(core: Arc<Mutex<Core>>, mut rx: mpsc::UnboundedReceiver<OutMsg
             let stream = l.stream.as_mut().unwrap();
             let line = match timeout(
                 Duration::from_millis(LOOP_TV_MS),
-                read_line(&mut l.inbound, stream),
+                read_line(&mut l.inbound, &mut **stream),
             )
             .await
             {
@@ -381,4 +473,33 @@ pub fn spawn(core: Arc<Mutex<Core>>, rx: mpsc::UnboundedReceiver<OutMsg>) {
     tokio::spawn(async move {
         run_task(core, rx).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_config_builds_with_public_roots() {
+        let cfg = build_client_config(None).expect("build without custom CA");
+        assert!(cfg.alpn_protocols.is_empty());
+    }
+
+    #[test]
+    fn client_config_rejects_missing_ca_file() {
+        let err = build_client_config(Some("definitely-not-a-file.pem")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn client_config_rejects_empty_ca_file() {
+        let p = std::env::temp_dir().join(format!("msapp-ca-empty-{}.pem", std::process::id()));
+        std::fs::write(&p, b"not a certificate\n").unwrap();
+        let err = build_client_config(Some(p.to_str().unwrap())).unwrap_err();
+        assert!(
+            err.to_string().contains("no PEM certificates"),
+            "unexpected error: {}",
+            err
+        );
+    }
 }
