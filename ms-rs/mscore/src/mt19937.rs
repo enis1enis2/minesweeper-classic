@@ -106,6 +106,13 @@ impl Mt19937 {
         self.index = N;
     }
 
+    /// CPython null-seed path (non-deterministic): key = 624 urandom words.
+    /// The caller supplies the words; this applies CPython init_by_array.
+    pub fn seed_from_words(&mut self, key: &[u32]) {
+        init_by_array(&mut self.state, key);
+        self.index = N;
+    }
+
     pub fn genrand_uint32(&mut self) -> u32 {
         if self.index >= N {
             for i in 0..N {
@@ -172,8 +179,14 @@ impl Mt19937 {
     }
 
     pub fn randint(&mut self, a: i64, b: i64) -> i64 {
-        let width = (b - a + 1) as u64;
-        a + self._randbelow(width) as i64
+        let n = (b - a + 1) as u64;
+        a + self._randbelow(n) as i64
+    }
+
+    /// `Random.randrange(a, b)` — u64 range, used by the sim server producer
+    /// and batch RNG (`randrange(0n, 1n << 63n)`).
+    pub fn randrange(&mut self, a: u64, b: u64) -> u64 {
+        a + self._randbelow(b - a)
     }
 
     pub fn shuffle<T>(&mut self, seq: &mut [T]) {
