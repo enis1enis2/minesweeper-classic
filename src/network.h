@@ -100,6 +100,17 @@ int  net_telemetry_start(const char *host, unsigned short port);
 void net_telemetry_stop(void);
 int  net_telemetry_active(void);
 
+/* HTTP(S) transport selection for the telemetry session.  mode 0 (default)
+ * is the raw TCP stream; 1 is plain HTTP and 2 is HTTPS.  Both HTTP modes
+ * go through WinHTTP (TLS via SChannel), mirroring the /ms-sim/ endpoints
+ * of the simulation server, and are selected with --telemetry-http /
+ * --telemetry-https.  Set before net_telemetry_start(). */
+void net_set_http_mode(int mode);
+
+/* When on, HTTP(S) mode skips WinHTTP certificate validation.  Debug/testing
+ * only (--telemetry-https-insecure); production uses a CA-signed cert. */
+void net_set_https_insecure(int on);
+
 /* Decode the obfuscated (base64) default telemetry endpoint into host
  * (NUL-terminated, up to hsz bytes) and *port.  Obfuscation only — the value
  * must be recoverable at runtime and is still sent in the clear on the wire.

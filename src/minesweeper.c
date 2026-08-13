@@ -125,9 +125,14 @@ static void metric_emit_over(const char *kind);
 /* telemetry endpoint.  Forced on by default (connects to the deployed
  * simulation server); --telemetry <host>:<port> overrides the endpoint and
  * --no-telemetry disables it for this session.  The default endpoint is
- * obfuscated (base64) in network.c, not readable as a plain string here. */
+ * obfuscated (base64) in network.c, not readable as a plain string here.
+ * --telemetry-http / --telemetry-https switch the session from the raw TCP
+ * stream to the /ms-sim/ HTTP(S) endpoints (WinHTTP); --telemetry-https
+ * with --telemetry-https-insecure skips certificate validation (debug). */
 static char     g_telemetry_host[128];
 static unsigned g_telemetry_port;
+static int      g_telemetry_http;          /* 0=raw TCP, 1=HTTP, 2=HTTPS */
+static int      g_telemetry_https_insecure;
 
 /* Marshals a streamed `seed <diff> <n>` line from the network thread to the
  * UI thread (the heap pointer travels as the WM_APP_TELEMETRY_SEED LPARAM). */
@@ -2003,8 +2008,11 @@ static void cli_dispatch(CliCmd *cc) {
     case CLI_TELEMETRY:
         if (cc->a == 0)
             net_telemetry_stop();
-        else if (cc->a == 1)
+        else if (cc->a == 1) {
+            net_set_http_mode(g_telemetry_http);
+            net_set_https_insecure(g_telemetry_https_insecure);
             net_telemetry_start(g_telemetry_host, g_telemetry_port);
+        }
         if (cc->a == -2)
             cli_append(&buf, &len, &cap, "ERR arg\n");
         else {
@@ -2442,6 +2450,12 @@ static void parse_telemetry_args(LPSTR lpCmd) {
             if (tok) parse_telemetry_arg(tok);
         } else if (_strnicmp(tok, "--telemetry=", 12) == 0) {
             parse_telemetry_arg(tok + 12);
+        } else if (stricmp(tok, "--telemetry-http") == 0) {
+            g_telemetry_http = 1;
+        } else if (stricmp(tok, "--telemetry-https") == 0) {
+            g_telemetry_http = 2;
+        } else if (stricmp(tok, "--telemetry-https-insecure") == 0) {
+            g_telemetry_https_insecure = 1;
         }
         tok = strtok_r(NULL, " \t\r", &save);
     }
@@ -2491,6 +2505,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
             g_telemetry_port = def_port;
     }
     parse_telemetry_args(lpCmd);
+    net_set_http_mode(g_telemetry_http);
+    net_set_https_insecure(g_telemetry_https_insecure);
     /* optional solver credentials: --solver-user/--solver-pass/
      * --solver-config <file>, else MS_SOLVER_USER/MS_SOLVER_PASS */
     leader_setup_solver(lpCmd);
