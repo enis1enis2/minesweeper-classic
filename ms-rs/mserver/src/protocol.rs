@@ -111,7 +111,10 @@ async fn simulate_game(
         e
     })?;
     msg.g.requester = opts.requester;
-    server.db.record_game(&msg.g);
+    server.db.record_game(&msg.g).map_err(|e| {
+        eprintln!("  simulate_game: record_game failed: {}", e);
+        "failed to record game".to_string()
+    })?;
     Ok((msg.g, msg.rng_state))
 }
 
@@ -203,7 +206,9 @@ async fn handle_lbscore(server: &Server, addr: &str, line: &str) {
     // The rate-limit bookkeeping must not hold the (non-async) lock across
     // any `.await`; compute the verdict first, then send.
     let verdict = {
-        let mut hist_map = server.lb_hist.lock().unwrap();
+        // Recover from a poisoned mutex: rate-limit bookkeeping must not
+        // hard-fail a leaderboard submission.
+        let mut hist_map = server.lb_hist.lock().unwrap_or_else(|p| p.into_inner());
         let hist = hist_map.entry(ip.clone()).or_default();
         hist.retain(|t| now - t < LB_WINDOW);
         if hist.len() >= LB_MAX {
@@ -246,7 +251,14 @@ async fn handle_lbscore(server: &Server, addr: &str, line: &str) {
         server.hub.send_to(addr, reply).await;
         return;
     }
-    let (improved, rank) = server.db.record_score(&name, &diff, ms);
+    let (improved, rank) = match server.db.record_score(&name, &diff, ms) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("  lbscore: record_score failed: {}", e);
+            server.hub.send_to(addr, "lbnotop").await;
+            return;
+        }
+    };
     if improved {
         server
             .hub
@@ -276,7 +288,15 @@ async fn handle_lbtop(server: &Server, addr: &str, line: &str) {
     if count < 1 || count > 100 {
         return;
     }
-    let entries = server.db.top_scores(diff.as_deref(), count);
+    let entries = match server.db.top_scores(diff.as_deref(), count) {
+        Ok(v) => v,
+        Err(e) => {
+            // Degrade to an empty leaderboard rather than killing the
+            // connection; the client still gets its lbtop/lbdone framing.
+            eprintln!("  lbtop: top_scores failed: {}", e);
+            Vec::new()
+        }
+    };
     match &diff {
         None => {
             server.hub.send_to(addr, &format!("lbtop {}", entries.len())).await;
@@ -595,7 +615,9 @@ pub async fn handle_conn(server: Arc<Server>, stream: TcpStream, addr: String) {
 
 async fn dispatch(server: &Arc<Server>, addr: &str, text: &str) -> bool {
     if text.starts_with("metric ") {
-        server.db.record_metric(now_sec(), addr, text);
+        if let Err(e) = server.db.record_metric(now_sec(), addr, text) {
+            eprintln!("  conn {}: record_metric failed: {}", addr, e);
+        }
     } else if text.starts_with("auth ") {
         handle_auth(server, addr, text).await;
     } else if text.starts_with("authresp ") {

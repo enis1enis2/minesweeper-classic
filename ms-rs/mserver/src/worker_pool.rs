@@ -60,7 +60,9 @@ impl WorkerPool {
     pub async fn submit(self: &Arc<Self>, task: Task) -> Result<TaskResult, String> {
         let id = loop {
             {
-                let mut idle = self.idle.lock().unwrap();
+                // Recover from a poisoned mutex (a worker panic elsewhere must
+                // not take down every game request).
+                let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(id) = idle.pop_back() {
                     break id;
                 }
@@ -76,12 +78,12 @@ impl WorkerPool {
             reply: reply_tx,
         };
         if self.tx[id].send(msg).await.is_err() {
-            self.idle.lock().unwrap().push_back(id);
+            self.idle.lock().unwrap_or_else(|p| p.into_inner()).push_back(id);
             self.notify.notify_one();
             return Err("worker task send failed".into());
         }
         let result = reply_rx.await.map_err(|_| "worker task failed".to_string())?;
-        self.idle.lock().unwrap().push_back(id);
+        self.idle.lock().unwrap_or_else(|p| p.into_inner()).push_back(id);
         self.notify.notify_one();
         result
     }

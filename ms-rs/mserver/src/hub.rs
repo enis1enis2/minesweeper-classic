@@ -57,7 +57,9 @@ impl ClientHub {
             dead: false,
         };
         self.clients.lock().await.insert(addr.clone(), cl);
-        self.db.upsert_client(&addr, now, true);
+        if let Err(e) = self.db.upsert_client(&addr, now, true) {
+            eprintln!("  hub: upsert_client {} failed: {}", addr, e);
+        }
     }
 
     pub async fn is_authed(&self, addr: &str) -> bool {
@@ -108,7 +110,9 @@ impl ClientHub {
     pub async fn remove(&self, addr: &str) {
         let existed = self.clients.lock().await.remove(addr).is_some();
         if existed {
-            self.db.upsert_client(addr, now_sec(), false);
+            if let Err(e) = self.db.upsert_client(addr, now_sec(), false) {
+                eprintln!("  hub: upsert_client {} failed: {}", addr, e);
+            }
         }
     }
 
@@ -132,7 +136,11 @@ impl ClientHub {
             Ok(_) => {
                 let (seeds, outcomes) = {
                     let mut m = self.clients.lock().await;
-                    let cl = m.get_mut(addr).unwrap();
+                    // The client can disconnect (and be removed) between the
+                    // writer clone above and this lock; that is not an error.
+                    let Some(cl) = m.get_mut(addr) else {
+                        return true;
+                    };
                     cl.last = now_sec();
                     if line.starts_with("seed ") {
                         cl.seeds += 1;
@@ -141,7 +149,9 @@ impl ClientHub {
                     }
                     (cl.seeds, cl.outcomes)
                 };
-                self.db.client_touch(addr, seeds, outcomes);
+                if let Err(e) = self.db.client_touch(addr, seeds, outcomes) {
+                    eprintln!("  hub: client_touch {} failed: {}", addr, e);
+                }
                 true
             }
             Err(_) => {
@@ -179,7 +189,11 @@ impl ClientHub {
                 Ok(_) => {
                     let (seeds, outcomes) = {
                         let mut m = self.clients.lock().await;
-                        let cl = m.get_mut(&addr).unwrap();
+                        // Client may have disconnected since `targets` was
+                        // snapshotted; skip bookkeeping rather than panic.
+                        let Some(cl) = m.get_mut(&addr) else {
+                            continue;
+                        };
                         cl.last = now_sec();
                         if line.starts_with("seed ") {
                             cl.seeds += 1;
@@ -198,7 +212,9 @@ impl ClientHub {
             self.mark_dead(a).await;
             self.remove(a).await;
         }
-        self.db.client_touch_many(&touched);
+        if let Err(e) = self.db.client_touch_many(&touched) {
+            eprintln!("  hub: client_touch_many failed: {}", e);
+        }
         sent
     }
 }

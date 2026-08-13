@@ -7,7 +7,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sim_games(
@@ -134,9 +134,17 @@ impl Database {
         })
     }
 
-    pub fn record_game(&self, g: &GameRow) {
+    /// Lock the connection, recovering from a poisoned mutex. A panic while a
+    /// statement was running (e.g. an OOM) poisons the lock; SQLite keeps the
+    /// connection usable after any single failed statement, so continuing is
+    /// safe and prevents one bad moment from DoS-ing every DB-backed request.
+    fn lock_conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn record_game(&self, g: &GameRow) -> rusqlite::Result<()> {
         let frontier_json = frontier_to_json(&g.frontier);
-        let c = self.conn.lock().unwrap();
+        let c = self.lock_conn();
         c.execute(
             "INSERT INTO sim_games(ts,difficulty,seed,won,moves,time_ms,guesses,chords,flags,deduce_batches,frontier,wall_ms,requester) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
@@ -154,63 +162,62 @@ impl Database {
                 g.wall_ms as i64,
                 g.requester.clone().unwrap_or_default()
             ],
-        )
-        .expect("insert sim_game");
+        )?;
         self.games.fetch_add(1, Ordering::Relaxed);
         if g.won {
             self.wins.fetch_add(1, Ordering::Relaxed);
         }
+        Ok(())
     }
 
-    pub fn record_metric(&self, ts: i64, addr: &str, line: &str) {
-        let c = self.conn.lock().unwrap();
+    pub fn record_metric(&self, ts: i64, addr: &str, line: &str) -> rusqlite::Result<()> {
+        let c = self.lock_conn();
         c.execute(
             "INSERT INTO client_metrics(ts,addr,line) VALUES(?1,?2,?3)",
             params![ts, addr, line],
-        )
-        .expect("insert metric");
+        )?;
         self.metrics.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
-    pub fn upsert_client(&self, addr: &str, connect_ts: i64, active: bool) {
-        let c = self.conn.lock().unwrap();
+    pub fn upsert_client(&self, addr: &str, connect_ts: i64, active: bool) -> rusqlite::Result<()> {
+        let c = self.lock_conn();
         c.execute(
             "INSERT INTO clients(addr,connect_ts,last_ts,seeds_sent,outcomes_sent,active) VALUES(?1,?2,?2,0,0,?3) ON CONFLICT(addr) DO UPDATE SET active=?3",
             params![addr, connect_ts, if active { 1 } else { 0 }],
-        )
-        .expect("upsert client");
+        )?;
+        Ok(())
     }
 
-    pub fn client_touch(&self, addr: &str, seeds: u64, outcomes: u64) {
-        let c = self.conn.lock().unwrap();
+    pub fn client_touch(&self, addr: &str, seeds: u64, outcomes: u64) -> rusqlite::Result<()> {
+        let c = self.lock_conn();
         c.execute(
             "UPDATE clients SET last_ts=?1, seeds_sent=?2, outcomes_sent=?3 WHERE addr=?4",
             params![now_sec(), seeds as i64, outcomes as i64, addr],
-        )
-        .expect("touch client");    }
+        )?;
+        Ok(())
+    }
 
-    pub fn client_touch_many(&self, rows: &[(String, u64, u64)]) {
+    pub fn client_touch_many(&self, rows: &[(String, u64, u64)]) -> rusqlite::Result<()> {
         if rows.is_empty() {
-            return;
+            return Ok(());
         }
         let now = now_sec();
-        let mut c = self.conn.lock().unwrap();
-        let tx = c.transaction().expect("begin tx");
+        let mut c = self.lock_conn();
+        let tx = c.transaction()?;
         for (a, s, o) in rows {
             tx.execute(
                 "UPDATE clients SET last_ts=?1, seeds_sent=?2, outcomes_sent=?3 WHERE addr=?4",
                 params![now, *s as i64, *o as i64, a],
-            )
-            .expect("touch client row");
+            )?;
         }
-        tx.commit().expect("commit tx");
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn counts(&self) -> (i64, i64, i64, i64) {
         let active = self
-            .conn
-            .lock()
-            .unwrap()
+            .lock_conn()
             .query_row("SELECT COUNT(*) FROM clients WHERE active=1", [], |r| {
                 r.get::<_, i64>(0)
             })
@@ -225,16 +232,15 @@ impl Database {
 
     /// Returns `(improved, rank)` where rank counts strictly-faster scores plus
     /// ties broken by insertion order, exactly like database.js record_score.
-    pub fn record_score(&self, name: &str, diff: &str, time_ms: u64) -> (bool, u64) {
-        let c = self.conn.lock().unwrap();
+    pub fn record_score(&self, name: &str, diff: &str, time_ms: u64) -> rusqlite::Result<(bool, u64)> {
+        let c = self.lock_conn();
         let cur: Option<(i64, u64)> = c
             .query_row(
                 "SELECT id, time_ms FROM leaderboard WHERE name=?1 AND difficulty=?2",
                 params![name, diff],
                 |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
             )
-            .optional()
-            .expect("score get");
+            .optional()?;
         let improved;
         let row_id: i64;
         match cur {
@@ -246,8 +252,7 @@ impl Database {
                 c.execute(
                     "UPDATE leaderboard SET time_ms=?1, ts=?2 WHERE id=?3",
                     params![time_ms as i64, now_sec(), id],
-                )
-                .expect("score update");
+                )?;
                 improved = true;
                 row_id = id;
             }
@@ -255,8 +260,7 @@ impl Database {
                 c.execute(
                     "INSERT INTO leaderboard(name,difficulty,time_ms,ts) VALUES(?1,?2,?3,?4)",
                     params![name, diff, time_ms as i64, now_sec()],
-                )
-                .expect("score insert");
+                )?;
                 row_id = c.last_insert_rowid();
                 improved = true;
             }
@@ -266,8 +270,7 @@ impl Database {
                 "SELECT time_ms, id FROM leaderboard WHERE name=?1 AND difficulty=?2",
                 params![name, diff],
                 |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
-            )
-            .expect("score best");
+            )?;
         let best_ms = best.0 as i64;
         let best_id = best.1;
         let below: i64 = c
@@ -275,61 +278,55 @@ impl Database {
                 "SELECT COUNT(*) FROM leaderboard WHERE difficulty=?1 AND time_ms < ?2",
                 params![diff, best_ms],
                 |r| r.get(0),
-            )
-            .expect("count below");
+            )?;
         let tied: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM leaderboard WHERE difficulty=?1 AND time_ms = ?2 AND id <= ?3",
                 params![diff, best_ms, best_id],
                 |r| r.get(0),
-            )
-            .expect("count tied");
+            )?;
         let _ = row_id;
-        (improved, (below + tied) as u64)
+        Ok((improved, (below + tied) as u64))
     }
 
     /// `(rank, name, difficulty, time_ms, ts)` per entry, rank counted within
     /// each difficulty like database.js top_scores.
-    pub fn top_scores(&self, diff: Option<&str>, limit: u64) -> Vec<(u64, String, String, u64, u64)> {
-        let c = self.conn.lock().unwrap();
+    pub fn top_scores(
+        &self,
+        diff: Option<&str>,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<(u64, String, String, u64, u64)>> {
+        let c = self.lock_conn();
         let mut rows = Vec::new();
         let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         if let Some(d) = diff {
-            let mut stmt = c
-                .prepare(
-                    "SELECT name, difficulty, time_ms, ts FROM leaderboard WHERE difficulty=?1 ORDER BY time_ms, id LIMIT ?2",
-                )
-                .expect("top diff stmt");
-            let iter = stmt
-                .query_map(params![d, limit as i64], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64))
-                })
-                .expect("query diff");
+            let mut stmt = c.prepare(
+                "SELECT name, difficulty, time_ms, ts FROM leaderboard WHERE difficulty=?1 ORDER BY time_ms, id LIMIT ?2",
+            )?;
+            let iter = stmt.query_map(params![d, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64))
+            })?;
             for row in iter {
-                let (name, d2, ms, ts) = row.expect("row");
+                let (name, d2, ms, ts) = row?;
                 let rank = counts.entry(d2.clone()).or_insert(0);
                 *rank += 1;
                 rows.push((*rank, name, d2, ms, ts));
             }
         } else {
-            let mut stmt = c
-                .prepare(
-                    "SELECT name, difficulty, time_ms, ts FROM leaderboard ORDER BY difficulty, time_ms, id LIMIT ?1",
-                )
-                .expect("top all stmt");
-            let iter = stmt
-                .query_map(params![limit as i64], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64))
-                })
-                .expect("query all");
+            let mut stmt = c.prepare(
+                "SELECT name, difficulty, time_ms, ts FROM leaderboard ORDER BY difficulty, time_ms, id LIMIT ?1",
+            )?;
+            let iter = stmt.query_map(params![limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64))
+            })?;
             for row in iter {
-                let (name, d, ms, ts) = row.expect("row");
+                let (name, d, ms, ts) = row?;
                 let rank = counts.entry(d.clone()).or_insert(0);
                 *rank += 1;
                 rows.push((*rank, name, d, ms, ts));
             }
         }
-        rows
+        Ok(rows)
     }
 }
 
@@ -357,4 +354,72 @@ fn fmt_float(v: f64) -> String {
         return "null".to_string();
     }
     format!("{}", v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game() -> GameRow {
+        GameRow {
+            ts: now_sec(),
+            difficulty: "beginner".to_string(),
+            seed: 42,
+            won: true,
+            moves: 5,
+            time_ms: 1234,
+            guesses: 0,
+            chords: 2,
+            flags: 1,
+            deduce_batches: 3,
+            frontier: vec![],
+            wall_ms: 5,
+            requester: Some("127.0.0.1:1".to_string()),
+        }
+    }
+
+    /// A panic while a statement runs poisons the connection mutex; every
+    /// subsequent DB call must recover instead of panicking (a single bad
+    /// moment must not DoS every DB-backed request).
+    #[test]
+    fn poisoned_lock_is_recovered() {
+        let db = Database::new(":memory:").unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = db.conn.lock().unwrap();
+            panic!("simulated panic while holding the conn lock");
+        });
+        assert!(db.conn.is_poisoned());
+        // The recovered lock is usable and a real operation succeeds.
+        db.record_game(&game()).unwrap();
+        assert_eq!(db.counts().0, 1);
+    }
+
+    /// A failed write (read-only database file) must surface as an Err and
+    /// leave the connection usable for reads - not panic and poison the lock.
+    #[test]
+    fn failed_write_is_result_not_panic() {
+        let dir = std::env::temp_dir().join(format!("ms_db_ro_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sim.db");
+        {
+            let db = Database::new(path.to_str().unwrap()).unwrap();
+            db.record_game(&game()).unwrap();
+            assert_eq!(db.counts().0, 1);
+        }
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        {
+            let db = Database::new(path.to_str().unwrap()).unwrap();
+            // Write must fail cleanly...
+            assert!(db.record_game(&game()).is_err());
+            // ...and reads on the same connection must still work.
+            assert!(db.top_scores(None, 10).is_ok());
+        }
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
