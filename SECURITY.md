@@ -25,20 +25,25 @@ untrusted input and on limiting what a network peer can forge or force.
 | C4 | `mserver` panic-free DB/network paths | All DB methods return `rusqlite::Result`; the connection mutex survives poisoning; client-writer races degrade gracefully (`let Some … else`); degraded paths reply with protocol-valid framing. |
 | C5 | Telemetry/session hygiene | Linux `telemetry on` restarts against the user-configured endpoint (not the hardcoded production host); verified msadmin sessions are in-memory only, never persisted; documented the plaintext telemetry stream and the `--no-telemetry` opt-out. |
 | C6 | Docs/tooling split | `SECURITY.md` threat model + accepted risks; internal docs moved out of the repo; `tools/README.md` documents the dev harnesses. |
-| C7 | TLS telemetry transport | `mserver` gained a native TLS listener (`--tls-port/--tls-cert/--tls-key`) and `msapp` a TLS client (`--tls`, `--tls-ca`); rustls terminates the same wire protocol, so seeds/metrics/leaderboard/`req*` are encrypted on the wire. Deployment (Let's Encrypt, Cloudflare, stunnel) is documented in `DEPLOYMENT.md`. Legacy C clients remain plaintext. |
+| C7 | TLS telemetry transport | `mserver` gained a native TLS listener (`--tls-port/--tls-cert/--tls-key`) and `msapp` a TLS client (`--tls`, `--tls-ca`); rustls terminates the same wire protocol, so seeds/metrics/leaderboard/`req*` are encrypted on the wire. Deployment (Let's Encrypt, Cloudflare, stunnel) is documented in `DEPLOYMENT.md`. |
+| C8–C11 | HTTP(S) `/ms-sim/*` telemetry transport | `mserver` exposes the sim protocol over HTTP(S) endpoints (`--http-port` / `--https-port`); `msapp` (`--http`, plus `--tls` for HTTPS), the Win32 client (`--telemetry-http/-https`, WinHTTP/SChannel) and the Linux client (`--telemetry-http/-https`, libcurl/OpenSSL) implement the same transport, so every client can now reach the telemetry link over HTTPS. `--telemetry-https-insecure` skips cert validation and is debug/test-only. Raw TCP stays the default and remains plaintext unless `--tls-port` or a relay is used. |
 
 ## Known limitations (accepted)
 
 These are deliberate, documented constraints. Do not assume protections that
 are not listed here.
 
-- **Plaintext telemetry remains the default and the only option for the C
-  clients.** TLS is available on the Rust path (`mserver --tls-*`, `msapp
-  --tls`) but must be explicitly enabled; the Win32 and Linux C clients have
-  no TLS stack and their wire traffic can be read by anyone observing the
-  network path (encrypt it with a local `stunnel` relay — see
-  `DEPLOYMENT.md`). The Windows device-diagnostics report is delivered
-  separately over HTTPS (`WinHTTP`, `WINHTTP_FLAG_SECURE`).
+- **Plaintext telemetry remains the default.** All clients default to the raw
+  TCP stream, which is plaintext unless the server's TLS listener
+  (`mserver --tls-*`) or the HTTP(S) transport is explicitly enabled. The C
+  clients now have a native HTTPS transport (`--telemetry-https` via
+  WinHTTP/SChannel on Windows and libcurl/OpenSSL on Linux) but it is opt-in;
+  in raw-TCP mode their wire traffic can be read by anyone observing the
+  network path (encrypt it with a local `stunnel` relay, or switch to
+  `--telemetry-https` — see `DEPLOYMENT.md`). `--telemetry-https-insecure`
+  disables certificate validation and is for testing only. The Windows
+  device-diagnostics report is delivered separately over HTTPS (`WinHTTP`,
+  `WINHTTP_FLAG_SECURE`).
 - **The metric/outcome stream is unauthenticated.** Anyone who can reach an
   `mserver` can connect, stream seeds and inject metric lines. HMAC-SHA256
   challenge authentication covers only the `req*` solver-request path (see
@@ -73,10 +78,12 @@ are not listed here.
   machines whose clients should participate. For production prefer the TLS
   listener (`--tls-port/--tls-cert/--tls-key`, public CA) and restrict the
   plaintext port to the C-client/stunnel-relay subnets — see
-  `DEPLOYMENT.md`.
-- **Clients:** prefer `msapp --tls` against a TLS-terminated endpoint
-  (`--tls-ca FILE` for private CAs). The write path is unauthenticated even
-  over TLS, so still restrict who can reach the port.
+  `DEPLOYMENT.md`. For HTTP(S) clients, expose `--https-port` (public CA) and
+  keep `--http-port` behind a front proxy / firewall.
+- **Clients:** prefer `msapp --http --tls` against a TLS-terminated endpoint
+  (`--tls-ca FILE` for private CAs); the C clients use `--telemetry-https`
+  (WinHTTP/libcurl). The write path is unauthenticated even over TLS, so still
+  restrict who can reach the port.
 - **Linux client:** `--no-telemetry` and `--telemetry host:port` are
   supported identically to the Win32 client.
 

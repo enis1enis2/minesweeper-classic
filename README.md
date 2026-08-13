@@ -196,6 +196,7 @@ the background, non-blocking). You can override or disable it:
 ```
 minesweeper-x64.exe --telemetry 127.0.0.1:28571   # different endpoint
 minesweeper-x64.exe --telemetry=host:port         # same, '=' form
+minesweeper-x64.exe --telemetry host:port --telemetry-https   # HTTPS /ms-sim transport
 minesweeper-x64.exe --no-telemetry                # disable for this session
 ```
 
@@ -209,18 +210,21 @@ minesweeper-x64.exe --no-telemetry                # disable for this session
   soon as the request completes.
 - The game reports `metric` lines: game starts, wins/losses, click counts,
   and UI input latency (10 s periodic), so the server can log live play.
-- The link is **plaintext by default**: the mserver protocol has no TLS layer
-  unless you enable it. The Rust server (`mserver`) can serve an **encrypted
-  TLS listener** (`--tls-port/--tls-cert/--tls-key`) and the Rust client
-  (`msapp`) connects with `--tls` (`--tls-ca FILE` for self-signed/private
-  certs) — see `DEPLOYMENT.md`. The legacy C clients (Win32 + Linux) always
-  speak plaintext; encrypt their wire with a local `stunnel` relay as
-  described there. Game metric lines, leaderboard submissions and the seed
-  stream are readable on the wire by anyone who can observe the network path
-  **when plaintext is used**. Device diagnostics (machine id, OS/CPU/GPU/RAM,
-  crash text) are a separate report and are delivered over **HTTPS** only. To
-  send nothing at all run with `--no-telemetry`, or point the stream at your
-  own server with `--telemetry host:port`.
+- The link is **plaintext by default**: the raw mserver protocol has no TLS
+  layer unless you enable it. The Rust server (`mserver`) can serve an
+  **encrypted TLS listener** (`--tls-port/--tls-cert/--tls-key`) and the Rust
+  client (`msapp`) connects with `--tls` (`--tls-ca FILE` for self-signed/
+  private certs) — see `DEPLOYMENT.md`. Every client can instead switch to the
+  HTTP(S) `/ms-sim/*` endpoints: `--telemetry-http` / `--telemetry-https` on
+  the C clients (Win32 uses WinHTTP/SChannel, Linux uses libcurl/OpenSSL;
+  `--telemetry-https-insecure` skips cert checks for testing) and `--http`
+  (plus `--tls` for HTTPS) on `msapp`, pointed at the server's `--http-port` /
+  `--https-port` listeners. Game metric lines, leaderboard submissions and the
+  seed stream are readable on the wire by anyone who can observe the network
+  path **when plaintext is used**. Device diagnostics (machine id,
+  OS/CPU/GPU/RAM, crash text) are a separate report and are delivered over
+  **HTTPS** only. To send nothing at all run with `--no-telemetry`, or point
+  the stream at your own server with `--telemetry host:port`.
 - Everything runs on a background thread; the UI never blocks on I/O, and
   with no server reachable the game simply keeps playing normally (it
   retries in the background).
@@ -429,8 +433,11 @@ systemctl enable --now minesweeper-sim
 
 > **TLS deployment:** the Rust server (`ms-rs/mserver`) can serve the same
 > protocol over an encrypted TLS listener (`--tls-port/--tls-cert/--tls-key`)
-> with the Rust client connecting via `--tls`. See `DEPLOYMENT.md` for
-> Let's Encrypt, Cloudflare and front-proxy setups.
+> with the Rust client connecting via `--tls`. All clients can also use the
+> HTTP(S) `/ms-sim/*` endpoints (`--http-port` / `--https-port` on `mserver`;
+> `--telemetry-http` / `--telemetry-https` on the C clients, `--http --tls` on
+> `msapp`). See `DEPLOYMENT.md` for Let's Encrypt, Cloudflare and front-proxy
+> setups.
 
 **UFW (allow client connections to the telemetry port):**
 

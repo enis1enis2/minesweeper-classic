@@ -1,9 +1,12 @@
 # Deployment guide: TLS for the telemetry/simulation link
 
 This guide explains how to encrypt the `mserver` telemetry link end to end, and
-how Cloudflare, Let's Encrypt and TLS front-proxies fit together. It covers the
-Rust clients (`ms-rs/msapp`) with native TLS, and the legacy C clients (Win32 +
-Linux) which still connect plaintext.
+how Cloudflare, Let's Encrypt and TLS front-proxies fit together. Every client
+(Rust `ms-rs/msapp`, Win32 C, Linux C) can talk to the simulation server either
+over the raw TCP streaming protocol (plaintext, or `--tls-port` for TLS) or
+over the HTTP(S) `/ms-sim/*` endpoints (WinHTTP / libcurl / native rustls).
+The raw stream still defaults to plaintext, so pick the transport that matches
+your deployment and threat model.
 
 Read `SECURITY.md` first for the threat model.
 
@@ -11,9 +14,10 @@ Read `SECURITY.md` first for the threat model.
 
 | Component | TLS support | How |
 |---|---|---|
-| `mserver` | **Native** | `--tls-port 28572 --tls-cert cert.pem --tls-key key.pem` (plaintext `--port` stays active) |
-| `msapp` (Rust GUI) | **Native** | `--tls` plus `--tls-ca FILE` when the cert is not from a public CA |
-| C clients (Win32/Linux) | **None today** | plaintext; encrypt the wire with a local `stunnel` client relay (see below) |
+| `mserver` (raw protocol) | **Native** | `--tls-port 28572 --tls-cert cert.pem --tls-key key.pem` (plaintext `--port` stays active) |
+| `mserver` (HTTP endpoints) | **Native** | `--https-port <p>` for HTTPS (certs required); `--http-port <p>` for plain HTTP |
+| `msapp` (Rust GUI) | **Native** | `--http` for the HTTP(S) `/ms-sim/*` transport; add `--tls` for HTTPS, `--tls-ca FILE` when the cert is not from a public CA |
+| C clients (Win32/Linux) | **Native (opt-in)** | `--telemetry-http` / `--telemetry-https` switch the C clients to `/ms-sim/*` via WinHTTP/SChannel or libcurl/OpenSSL; `--telemetry-https-insecure` skips cert checks (debug only). Raw-TCP mode stays plaintext (use a `stunnel` relay to encrypt it) |
 
 TLS wraps the existing line protocol — seeds, metrics, leaderboard and the
 `req*` solver requests all travel over the same messages, just encrypted. No
@@ -151,15 +155,93 @@ The client side is identical to Option A (`--tls` / `--tls-ca`), since the
 proxy speaks the same TLS. Restart the proxy on cert renewal instead of
 `mserver`.
 
+## Option D — HTTP(S) `/ms-sim/*` transport (all clients)
+
+In addition to the raw streaming protocol, `mserver` exposes the same wire
+messages over HTTP(S) under `/ms-sim/*`. This makes the telemetry link an
+ordinary web API — it works through nginx, Caddy or Cloudflare's free HTTP
+proxy, and it is the only native TLS option for the C clients.
+
+`mserver` listeners:
+
+- `--http-port <p>` — plain HTTP `/ms-sim/*` endpoints (for a TLS front-proxy
+  or Cloudflare in front).
+- `--https-port <p>` — HTTPS `/ms-sim/*` endpoints, terminated natively by
+  `mserver` (requires `--tls-cert` + `--tls-key`).
+
+Endpoints (all under `/ms-sim/`):
+
+```
+GET  /ms-sim/healthz            -> {"ok":true}
+POST /ms-sim/metrics            body: metric lines            -> {"ok":true}
+POST /ms-sim/auth               body: `auth <user>`           -> authchal <nonce> / autherr
+POST /ms-sim/req                headers X-Ms-User + X-Ms-Auth (HMAC-SHA256 over
+                                "ms-auth:<nonce>"), body: req lines -> reqok / reqfail
+GET  /ms-sim/seeds?since=N      -> seed/outcome lines, X-Ms-Cursor header
+POST /ms-sim/lbscore            body: lbscore lines           -> lbstored / lbnotop / lbdenied
+GET  /ms-sim/lbtop?count=N&diff=D -> lbtop / lbentry / lbdone lines
+```
+
+Client flags:
+
+| Client | Plain HTTP | HTTPS | Skip cert checks |
+|---|---|---|---|
+| Win32 C | `--telemetry-http` | `--telemetry-https` | `--telemetry-https-insecure` (test only) |
+| Linux C | `--telemetry-http` | `--telemetry-https` | `--telemetry-https-insecure` (test only) |
+| `msapp` (Rust) | `--http` | `--http --tls` | `--tls-ca FILE` (trust a private CA) |
+
+Point the client at the **HTTP(S) endpoint port**, not the raw-protocol
+`--port`/`--tls-port`:
+
+```sh
+# server: HTTP endpoints behind a TLS front proxy
+mserver --port 28571 --http-port 8080
+
+# server: HTTPS terminated by mserver itself (public CA)
+mserver --port 28571 --https-port 28573 \
+        --tls-cert /etc/letsencrypt/live/ms.example.com/fullchain.pem \
+        --tls-key  /etc/letsencrypt/live/ms.example.com/privkey.pem
+
+# Win32 / Linux C client over HTTPS (public CA)
+minesweeper --telemetry ms.example.com:28573 --telemetry-https
+
+# msapp over the same HTTPS endpoint
+msapp --telemetry ms.example.com:28573 --http --tls
+```
+
+`--telemetry-https-insecure` disables certificate validation and is for
+testing against a self-signed cert only; production traffic must use a
+validated trust chain (public CA, or `--tls-ca FILE` on `msapp`).
+
 ## Cloudflare — what actually proxies what
 
-Cloudflare's **free** plan is an **HTTP/HTTPS reverse proxy**: it can only
-proxy web traffic (ports 80/443 and a few HTTP(S) alt ports). The mserver
-telemetry protocol is a **raw TCP protocol on a custom port (28571)**, not
-HTTP, so the free CDN will not carry it. A free-zone A record set to "DNS
-only" (grey cloud) makes Cloudflare act purely as a DNS host — the connection
-goes **directly** to your VPS and Cloudflare is not in the data path at all.
-That is the correct free configuration:
+Cloudflare's **free** plan is an **HTTP/HTTPS reverse proxy**: it proxies web
+traffic on ports 80/443 and a few HTTP(S) alt ports. The telemetry suite has
+two transports, and they behave very differently behind Cloudflare.
+
+**HTTP(S) `/ms-sim/*` endpoints (all clients).** These are ordinary web
+requests, so the free plan proxies them normally. Run `mserver --http-port
+8080` behind a proxied ("orange cloud") record, or `--https-port 28573` for
+origin-side TLS:
+
+```sh
+# msapp and C clients through Cloudflare (edge TLS, origin on --http-port)
+msapp       --telemetry ms.example.com:443  --http --tls
+minesweeper --telemetry ms.example.com:443  --telemetry-https
+```
+
+Terminate TLS either at the edge (Cloudflare SSL/TLS mode Full or Full
+(strict)) with the origin on `--http-port`, or at the origin with
+`--https-port` and Cloudflare set to connect to it. For private certs use a
+**Cloudflare Origin CA** certificate with `--tls-ca FILE` on `msapp` (the C
+clients have no CA-pinning option other than `--telemetry-https-insecure`,
+which is test-only).
+
+**Raw TCP protocol (`--port`, `--tls-port`).** This is not HTTP, so the free
+CDN will not carry it. A free-zone A record set to "DNS only" (grey cloud)
+makes Cloudflare act purely as a DNS host — the connection goes **directly**
+to your VPS and Cloudflare is not in the data path at all. That is the correct
+free configuration for raw-TCP clients:
 
 - DNS-only record `ms.example.com → <VPS IP>` (grey cloud).
 - Let's Encrypt cert (Option A) terminates at the origin.
@@ -187,15 +269,23 @@ your own") edge certificate. With a DNS-only record there is no Cloudflare in
 the path, so the Let's Encrypt cert simply terminates at the origin, which is
 the simplest correct setup.
 
-## The C clients (Win32 + Linux) stay plaintext
+## The C clients: raw TCP stays plaintext, HTTP(S) is opt-in
 
-The Win32 and Linux C clients have no TLS stack in the build. Options to keep
-them safe on the wire:
+The Win32 and Linux C clients keep the raw TCP stream as the default (the
+original protocol, no TLS in that mode). Options to keep them safe on the
+wire:
 
-1. **Local stunnel client relay.** Run a stunnel client on each machine that
-   listens on `127.0.0.1:28571` and forwards over TLS to the server
-   (`ms.example.com:28572`). The game keeps talking plaintext to localhost;
-   the WAN leg is encrypted. `--telemetry 127.0.0.1:28571` in every client.
+1. **Use the HTTP(S) transport (recommended).** `--telemetry-http` /
+   `--telemetry-https` points the C client at the `--http-port` /
+   `--https-port` endpoints (see Option D). Over HTTPS the link is encrypted
+   end to end by WinHTTP/SChannel on Windows and libcurl/OpenSSL on Linux, so
+   no relay is needed. Use `--telemetry-https-insecure` only for testing
+   against a self-signed cert.
+2. **Local stunnel client relay** (raw-TCP mode only). Run a stunnel client on
+   each machine that listens on `127.0.0.1:28571` and forwards over TLS to the
+   server (`ms.example.com:28572`). The game keeps talking plaintext to
+   localhost; the WAN leg is encrypted. `--telemetry 127.0.0.1:28571` in every
+   client.
    ```
    # /etc/stunnel/ms-client.conf  (client machine)
    client = yes
@@ -203,10 +293,10 @@ them safe on the wire:
    accept = 127.0.0.1:28571
    connect = ms.example.com:28572
    ```
-2. **Restrict the plaintext port.** Firewall the server's `--port` (28571) so
+3. **Restrict the plaintext port.** Firewall the server's `--port` (28571) so
    only the C-client subnets (or the stunnel relays) can reach it, and keep
-   the TLS port open for Rust clients.
-3. **`--no-telemetry`** on clients that do not need the link at all.
+   the TLS/HTTPS ports open for the clients that use them.
+4. **`--no-telemetry`** on clients that do not need the link at all.
 
 ## Firewall
 
@@ -214,9 +304,11 @@ Debian/Ubuntu (UFW), allowing only what you need:
 
 ```sh
 sudo ufw allow 28572/tcp comment 'telemetry TLS (Rust clients + stunnel relays)'
+sudo ufw allow 28573/tcp comment 'telemetry HTTPS (/ms-sim endpoints)'
 sudo ufw allow from 10.0.0.0/24 to any port 28571/tcp comment 'plaintext telemetry (C clients)'
 # or close plaintext entirely:
 # sudo ufw deny 28571/tcp
+# --http-port (8080) should stay behind a front proxy / firewall, not exposed
 ```
 
 `msadmin` binds `127.0.0.1:8444` by default — do not expose it publicly (see
@@ -233,9 +325,13 @@ openssl s_client -connect ms.example.com:28572 -servername ms.example.com \
 
 # plaintext port (if still open) answers with the protocol
 nc -vz ms.example.com 28571
+
+# HTTP(S) /ms-sim endpoints answer
+curl -s https://ms.example.com:28573/ms-sim/healthz
+curl -s "http://ms.example.com:8080/ms-sim/seeds?since=0"
 ```
 
-Then connect a client with `--tls` and confirm `telemetry` shows
-`connected=1` and rising `seeds=` counts. In the repo test suite,
-`ms-rs/mserver/tests/tls_roundtrip.rs` exercises a full TLS auth + `reqseed`
-round trip against a self-signed cert.
+Then connect a client with `--tls` (or `--telemetry-https` / `--http --tls`)
+and confirm `telemetry` shows `connected=1` and rising `seeds=` counts. In the
+repo test suite, `ms-rs/mserver/tests/tls_roundtrip.rs` exercises a full TLS
+auth + `reqseed` round trip against a self-signed cert.
