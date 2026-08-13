@@ -34,6 +34,11 @@ int  net_telemetry_start(const char *host, unsigned short port);
 void net_telemetry_stop(void);
 int  net_telemetry_active(void);
 
+/* Last-configured telemetry endpoint (the production default until the
+ * first start()).  Lets callers restart the session against the endpoint the
+ * user actually selected instead of a hardcoded host. */
+void net_telemetry_endpoint(char *host, size_t hsz, unsigned short *port);
+
 /* Enqueue a metric line (printf-style).  Thread-safe, never blocks the
  * caller: drops the oldest pending metric if the queue is full. */
 void net_send_metric(const char *fmt, ...);

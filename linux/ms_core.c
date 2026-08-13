@@ -1221,8 +1221,12 @@ static void cli_dispatch(CliCmd *cc) {
     case CLI_TELEMETRY:
         if (cc->a == 0)
             net_telemetry_stop();
-        else if (cc->a == 1)
-            net_telemetry_start("135.125.79.15", 28571);
+        else if (cc->a == 1) {
+            char host[64];
+            unsigned short port;
+            net_telemetry_endpoint(host, sizeof(host), &port);
+            net_telemetry_start(host, port);
+        }
         if (cc->a == -2)
             cli_append(&buf, &len, &cap, "ERR arg\n");
         else {

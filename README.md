@@ -206,6 +206,12 @@ minesweeper-x64.exe --no-telemetry                # disable for this session
   soon as the request completes.
 - The game reports `metric` lines: game starts, wins/losses, click counts,
   and UI input latency (10 s periodic), so the server can log live play.
+- The link is **plaintext**: the mserver protocol has no TLS layer, so the
+  metric lines, leaderboard submissions and seed stream can be read by
+  anyone who can observe the network path. Device diagnostics (machine id,
+  OS/CPU/GPU/RAM, crash text) are a separate report and are delivered over
+  **HTTPS** only. To send nothing at all run with `--no-telemetry`, or point
+  the stream at your own server with `--telemetry host:port`.
 - Everything runs on a background thread; the UI never blocks on I/O, and
   with no server reachable the game simply keeps playing normally (it
   retries in the background).

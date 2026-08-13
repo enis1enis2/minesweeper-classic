@@ -54,8 +54,8 @@ static const int g_diff_count = (int)(sizeof(g_diff_names_t) / sizeof(g_diff_nam
 
 /* ---- connection state (written by the network thread only) ---- */
 static int   g_sock = -1;
-static char  g_host[64];
-static unsigned short g_port = 0;
+static char  g_host[64] = "135.125.79.15";
+static unsigned short g_port = 28571;
 static int   g_connected = 0;
 
 /* A remote-simulation session is active from the moment a req* line is
@@ -627,6 +627,14 @@ void net_telemetry_stop(void) {
 
 int net_telemetry_active(void) {
     return g_running ? 1 : 0;
+}
+
+void net_telemetry_endpoint(char *host, size_t hsz, unsigned short *port) {
+    if (host && hsz) {
+        strncpy(host, g_host, hsz - 1);
+        host[hsz - 1] = 0;
+    }
+    if (port) *port = g_port;
 }
 
 void ms_net_setup_sinks(void) {
