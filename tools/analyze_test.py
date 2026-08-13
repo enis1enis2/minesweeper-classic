@@ -9,7 +9,7 @@ identical per-cell layout so the two can be diffed.
 """
 import sys
 
-sys.path.insert(0, "minesweeper_bot")
+sys.path.insert(0, "archive/minesweeper_bot")
 
 from ms_solver import Board, build_constraints, frontier_probabilities  # noqa: E402
 
