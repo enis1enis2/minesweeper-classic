@@ -1967,6 +1967,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "msadmin"
+version = "1.0.0"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "hmac",
+ "rand",
+ "rusqlite",
+ "scrypt",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "msapp"
 version = "1.0.0"
 dependencies = [

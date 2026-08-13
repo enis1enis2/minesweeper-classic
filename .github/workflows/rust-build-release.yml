@@ -24,9 +24,10 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          ls -lh ms-rs/target/release/msapp.exe ms-rs/target/release/mserver.exe ms-rs/target/release/msparity.exe
+          ls -lh ms-rs/target/release/msapp.exe ms-rs/target/release/mserver.exe ms-rs/target/release/msparity.exe ms-rs/target/release/msadmin.exe
           ./ms-rs/target/release/mserver.exe --help >/dev/null
           ./ms-rs/target/release/msparity.exe --help >/dev/null
+          ./ms-rs/target/release/msadmin.exe --selfcheck >/dev/null
       - name: Assemble assets
         shell: bash
         run: |
@@ -34,6 +35,7 @@ jobs:
           cp ms-rs/target/release/msapp.exe    dist/msapp-windows-x86_64.exe
           cp ms-rs/target/release/mserver.exe  dist/mserver-windows-x86_64.exe
           cp ms-rs/target/release/msparity.exe dist/msparity-windows-x86_64.exe
+          cp ms-rs/target/release/msadmin.exe  dist/msadmin-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
@@ -56,15 +58,17 @@ jobs:
         run: cargo build --release --manifest-path ms-rs/Cargo.toml
       - name: Smoke test
         run: |
-          file ms-rs/target/release/msapp ms-rs/target/release/mserver ms-rs/target/release/msparity
+          file ms-rs/target/release/msapp ms-rs/target/release/mserver ms-rs/target/release/msparity ms-rs/target/release/msadmin
           ./ms-rs/target/release/mserver --help >/dev/null
           ./ms-rs/target/release/msparity --help >/dev/null
+          ./ms-rs/target/release/msadmin --selfcheck >/dev/null
       - name: Assemble assets
         run: |
           mkdir -p dist
           cp ms-rs/target/release/msapp    dist/msapp-linux-x86_64
           cp ms-rs/target/release/mserver  dist/mserver-linux-x86_64
           cp ms-rs/target/release/msparity dist/msparity-linux-x86_64
+          cp ms-rs/target/release/msadmin  dist/msadmin-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
@@ -81,15 +85,17 @@ jobs:
         run: cargo build --release --manifest-path ms-rs/Cargo.toml
       - name: Smoke test
         run: |
-          file ms-rs/target/release/msapp ms-rs/target/release/mserver ms-rs/target/release/msparity
+          file ms-rs/target/release/msapp ms-rs/target/release/mserver ms-rs/target/release/msparity ms-rs/target/release/msadmin
           ./ms-rs/target/release/mserver --help >/dev/null
           ./ms-rs/target/release/msparity --help >/dev/null
+          ./ms-rs/target/release/msadmin --selfcheck >/dev/null
       - name: Assemble assets
         run: |
           mkdir -p dist
           cp ms-rs/target/release/msapp    dist/msapp-macos-aarch64
           cp ms-rs/target/release/mserver  dist/mserver-macos-aarch64
           cp ms-rs/target/release/msparity dist/msparity-macos-aarch64
+          cp ms-rs/target/release/msadmin  dist/msadmin-macos-aarch64
       - uses: actions/upload-artifact@v4
         with:
           name: macos-aarch64
@@ -123,6 +129,7 @@ jobs:
             - **msapp** — Minesweeper GUI client (egui/eframe) with `--listen` scripting server and telemetry link
             - **mserver** — simulation/telemetry server (1:1 port of `server.js`)
             - **msparity** — differential byte-parity harness
+            - **msadmin** — diagnostics admin web server (1:1 port of `ms/admin/*`, drop-in compatible with the existing Node admin config/db/key)
 
             Format per platform:
             - Windows: `.exe` (PE)
