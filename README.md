@@ -475,6 +475,23 @@ The receiver is the same deployment as the simulation server
 (`admin.jellyfiner.dpdns.org`, TLS via Let's Encrypt). With the telemetry
 link disabled (`--no-telemetry`) no diagnostics connection is made at all.
 
+### Admin server: trusting a reverse proxy
+
+`msadmin` records the client IP it saw for each diagnostics row and keys its
+login-lockout on that IP. By default it trusts only the TCP peer address, so a
+remote client cannot spoof the recorded/locked IP by sending
+`CF-Connecting-IP` or `X-Forwarded-For` headers. When the admin server runs
+behind a reverse proxy (e.g. the Let's Encrypt TLS front end above), pass the
+proxy's address so its forwarding headers are honored:
+
+```
+msadmin ... --trusted-proxy 127.0.0.1 --trusted-proxy 10.0.0.0/8
+```
+
+`--trusted-proxy` accepts an IP or a CIDR prefix and may be repeated. Only
+requests whose socket peer matches a listed proxy use the forwarded header;
+every other request is attributed to its socket address.
+
 ## License
 
 MIT — see below.

@@ -176,7 +176,7 @@ fn wait_for_port(child: &mut Child) -> (String, String) {
     }
 }
 
-fn start_server(tmp: &std::path::Path) -> Child {
+fn start_server(tmp: &std::path::Path, extra_args: &[&str]) -> Child {
     let key = msadmin::crypt::generate_key();
     let secret_bytes: Vec<u8> = (0u8..20).collect();
     let secret = encode_base32(&secret_bytes);
@@ -187,24 +187,29 @@ fn start_server(tmp: &std::path::Path) -> Child {
     );
     std::fs::write(tmp.join("diag.key"), format!("{key}\n")).unwrap();
     std::fs::write(tmp.join("admin.json"), config).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_msadmin"))
-        .args([
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "0",
-            "--db",
-            ":memory:",
-            "--config",
-            tmp.join("admin.json").to_str().unwrap(),
-            "--key",
-            tmp.join("diag.key").to_str().unwrap(),
-        ])
+    let config_path = tmp.join("admin.json").to_str().unwrap().to_string();
+    let key_path = tmp.join("diag.key").to_str().unwrap().to_string();
+    let mut args: Vec<String> = vec![
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        "0".into(),
+        "--db".into(),
+        ":memory:".into(),
+        "--config".into(),
+        config_path,
+        "--key".into(),
+        key_path,
+    ];
+    for a in extra_args {
+        args.push(a.to_string());
+    }
+    Command::new(env!("CARGO_BIN_EXE_msadmin"))
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn msadmin");
-    child
+        .expect("spawn msadmin")
 }
 
 struct ChildGuard(Child);
@@ -236,7 +241,7 @@ fn login(addr: &str) -> (String, String) {
 fn admin_e2e_over_tcp() {
     let tmp = std::env::temp_dir().join(format!("msadmin-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
-    let mut guard = ChildGuard(start_server(&tmp));
+    let mut guard = ChildGuard(start_server(&tmp, &[]));
     let (addr, _line) = wait_for_port(&mut guard.0);
     eprintln!("[e2e] server at {addr}");
 
@@ -400,6 +405,64 @@ fn admin_e2e_over_tcp() {
     let r = get(&addr, "/ms-admin/healthz", None);
     assert_eq!(r.status, 200);
     assert_eq!(r.body, "ok\n");
+
+    drop(guard);
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+fn failed_login(addr: &str, extra_headers: &[(&str, &str)]) -> HttpResp {
+    http(
+        addr,
+        "POST",
+        "/ms-admin/login",
+        extra_headers,
+        "username=admin&password=wrong-password&totp=000000".as_bytes(),
+    )
+}
+
+#[test]
+fn untrusted_peer_cannot_spoof_lockout_ip() {
+    // No --trusted-proxy configured: the socket peer is authoritative, so an
+    // attacker cannot lock out a victim (or evade their own lockout) by
+    // sending forwarding headers.
+    let tmp = std::env::temp_dir().join(format!("msadmin-spoof-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut guard = ChildGuard(start_server(&tmp, &[]));
+    let (addr, _) = wait_for_port(&mut guard.0);
+
+    // Five failed logins, each claiming a different victim IP.
+    for _ in 0..5 {
+        let r = failed_login(&addr, &[("X-Forwarded-For", "198.51.100.7")]);
+        assert_eq!(r.status, 401);
+    }
+    // The lockout was recorded under the real peer (127.0.0.1), so the next
+    // attempt from that peer -- without any forwarded header -- is locked.
+    let r = failed_login(&addr, &[]);
+    assert_eq!(r.status, 423, "got: {}", r.body);
+
+    drop(guard);
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn trusted_proxy_honors_forwarded_lockout_ip() {
+    // When the peer is a configured trusted proxy, the forwarded IP is
+    // honored (real-world deployment sits behind the proxy).
+    let tmp = std::env::temp_dir().join(format!("msadmin-trust-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut guard = ChildGuard(start_server(&tmp, &["--trusted-proxy", "127.0.0.1"]));
+    let (addr, _) = wait_for_port(&mut guard.0);
+
+    for _ in 0..5 {
+        let r = failed_login(&addr, &[("X-Forwarded-For", "198.51.100.7")]);
+        assert_eq!(r.status, 401);
+    }
+    // Failures were attributed to the forwarded IP, so the real peer is NOT locked...
+    let r = failed_login(&addr, &[]);
+    assert_eq!(r.status, 401, "got: {}", r.body);
+    // ...but that forwarded IP is now locked.
+    let r = failed_login(&addr, &[("X-Forwarded-For", "198.51.100.7")]);
+    assert_eq!(r.status, 423, "got: {}", r.body);
 
     drop(guard);
     std::fs::remove_dir_all(&tmp).ok();

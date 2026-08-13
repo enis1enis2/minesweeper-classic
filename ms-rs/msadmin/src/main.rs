@@ -20,6 +20,7 @@ struct Opts {
     key: String,
     session_ttl: i64,
     username: String,
+    trusted_proxies: Vec<String>,
 }
 
 impl Default for Opts {
@@ -35,12 +36,13 @@ impl Default for Opts {
             key: "data/diag.key".to_string(),
             session_ttl: 14400,
             username: "admin".to_string(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
 
 fn usage() -> String {
-    "usage: msadmin [--init | --selfcheck | --help]\n       msadmin [--host HOST] [--port PORT] [--db PATH] [--config PATH] [--key PATH] [--session-ttl SECS] [--username NAME]\n"
+    "usage: msadmin [--init | --selfcheck | --help]\n       msadmin [--host HOST] [--port PORT] [--db PATH] [--config PATH] [--key PATH] [--session-ttl SECS] [--username NAME] [--trusted-proxy IP|CIDR]\n\noptions:\n  --trusted-proxy IP|CIDR   proxy whose forwarding headers (cf-connecting-ip,\n                            x-forwarded-for) are honored; repeatable. Requests\n                            from any other peer are attributed to the socket\n                            address, so unconfigured clients cannot spoof the\n                            recorded/locked IP.\n"
         .to_string()
 }
 
@@ -52,7 +54,8 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             "--init" => opts.init = true,
             "--selfcheck" => opts.selfcheck = true,
             "--help" => opts.help = true,
-            "--host" | "--port" | "--db" | "--config" | "--key" | "--session-ttl" | "--username" => {
+            "--host" | "--port" | "--db" | "--config" | "--key" | "--session-ttl" | "--username"
+            | "--trusted-proxy" => {
                 let value = it
                     .next()
                     .ok_or_else(|| format!("missing value for {arg}"))?;
@@ -66,6 +69,10 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                         opts.session_ttl = value
                             .parse::<i64>()
                             .map_err(|_| format!("invalid --session-ttl value: '{value}'"))?
+                    }
+                    "--trusted-proxy" => {
+                        http::validate_trusted_proxy(value)?;
+                        opts.trusted_proxies.push(value.clone());
                     }
                     _ => opts.username = value.clone(),
                 }
@@ -277,6 +284,7 @@ async fn cmd_run(opts: &Opts) -> Result<i32, String> {
         auth: std::sync::Mutex::new(auth),
         key,
         ingest: std::sync::Mutex::new(Vec::new()),
+        trusted_proxies: opts.trusted_proxies.clone(),
     });
     let addr = format!("{}:{}", opts.host, opts.port);
     let listener = tokio::net::TcpListener::bind(&addr)

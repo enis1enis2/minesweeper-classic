@@ -45,6 +45,9 @@ pub struct State {
     pub auth: Mutex<AuthStore>,
     pub key: String,
     pub ingest: Mutex<Vec<i64>>,
+    /// Proxies (IP or CIDR) whose forwarding headers are trusted. Requests
+    /// from any other peer are attributed to the socket peer address.
+    pub trusted_proxies: Vec<String>,
 }
 
 pub struct HttpRequest {
@@ -342,16 +345,90 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
-fn real_ip(req: &HttpRequest, peer: std::net::SocketAddr) -> String {
+/// Validate a `--trusted-proxy` value: a bare IP or a CIDR prefix.
+pub fn validate_trusted_proxy(entry: &str) -> Result<(), String> {
+    let err = || format!("bad --trusted-proxy '{entry}': expected an IP address or CIDR (e.g. 203.0.113.4 or 10.0.0.0/8)");
+    match entry.split_once('/') {
+        Some((base, prefix)) => {
+            let bits = match base.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(_)) => 32u8,
+                Ok(std::net::IpAddr::V6(_)) => 128u8,
+                Err(_) => return Err(err()),
+            };
+            let p: u8 = prefix
+                .parse()
+                .map_err(|_| err())?;
+            if p > bits {
+                return Err(err());
+            }
+            Ok(())
+        }
+        None => match entry.parse::<std::net::IpAddr>() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(err()),
+        },
+    }
+}
+
+/// True when `ip` matches any entry in the trusted-proxy list.
+fn peer_is_trusted(ip: &std::net::IpAddr, trusted: &[String]) -> bool {
+    trusted.iter().any(|e| ip_in_entry(ip, e))
+}
+
+fn ip_in_entry(ip: &std::net::IpAddr, entry: &str) -> bool {
+    match entry.split_once('/') {
+        Some((base, prefix)) => {
+            let prefix: u8 = match prefix.parse() {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            match (ip, base.parse::<std::net::IpAddr>()) {
+                (std::net::IpAddr::V4(a), Ok(std::net::IpAddr::V4(b))) => {
+                    if prefix > 32 {
+                        return false;
+                    }
+                    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+                    (u32::from(*a) & mask) == (u32::from(b) & mask)
+                }
+                (std::net::IpAddr::V6(a), Ok(std::net::IpAddr::V6(b))) => {
+                    if prefix > 128 {
+                        return false;
+                    }
+                    let mask = if prefix == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - prefix)
+                    };
+                    (u128::from(*a) & mask) == (u128::from(b) & mask)
+                }
+                _ => false,
+            }
+        }
+        None => match (ip, entry.parse::<std::net::IpAddr>()) {
+            (a, Ok(b)) => a == &b,
+            _ => false,
+        },
+    }
+}
+
+/// Resolve the client IP for a request. Forwarding headers
+/// (`cf-connecting-ip`, `x-forwarded-for`) are ONLY honored when the socket
+/// peer is a configured trusted proxy; for every other peer the socket
+/// address is authoritative, so a remote attacker cannot spoof the value
+/// used for ingest attribution and login-lockout accounting.
+fn real_ip(req: &HttpRequest, peer: std::net::SocketAddr, trusted: &[String]) -> String {
+    if !peer_is_trusted(&peer.ip(), trusted) {
+        return peer.ip().to_string();
+    }
     if let Some(v) = req.header("cf-connecting-ip") {
         let first = v.split(',').next().unwrap_or("").trim();
-        if !first.is_empty() {
+        if !first.is_empty() && first.parse::<std::net::IpAddr>().is_ok() {
             return first.to_string();
         }
     }
     if let Some(v) = req.header("x-forwarded-for") {
         let first = v.split(',').next().unwrap_or("").trim();
-        if !first.is_empty() {
+        if !first.is_empty() && first.parse::<std::net::IpAddr>().is_ok() {
             return first.to_string();
         }
     }
@@ -793,7 +870,7 @@ pub async fn handle_conn(state: Arc<State>, mut stream: TcpStream) -> std::io::R
         }
         Err(_) => return Ok(()),
     };
-    let ip = real_ip(&request, peer);
+    let ip = real_ip(&request, peer, &state.trusted_proxies);
     println!("{ip} {} {}", request.method, request.path);
     let response = route(&state, &request.method, &request.path, &request, &ip);
     write_response(&mut stream, &response).await
@@ -847,5 +924,95 @@ mod tests {
         assert_eq!(normalize_number(&Value::from(4.0)), Value::from(4));
         assert_eq!(normalize_number(&Value::from(4.5)), Value::from(4.5));
         assert_eq!(normalize_number(&Value::from(4)), Value::from(4));
+    }
+
+    fn req_with_headers(headers: &[(&str, &str)]) -> HttpRequest {
+        let mut map = HashMap::new();
+        for (k, v) in headers {
+            map.insert(k.to_string(), v.to_string());
+        }
+        HttpRequest {
+            method: "POST".to_string(),
+            path: "/ms-diag/ingest".to_string(),
+            headers: map,
+            body: Vec::new(),
+            body_too_large: false,
+        }
+    }
+
+    const PEER: std::net::SocketAddr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9)), 4444);
+
+    #[test]
+    fn untrusted_peer_ignores_forwarded_headers() {
+        // Attackers who are NOT a configured proxy cannot influence the
+        // recorded/locked IP by sending headers.
+        let req = req_with_headers(&[
+            ("cf-connecting-ip", "203.0.113.66"),
+            ("x-forwarded-for", "203.0.113.66, 10.0.0.2"),
+        ]);
+        assert_eq!(real_ip(&req, PEER, &[]), "198.51.100.9");
+        assert_eq!(real_ip(&req, PEER, &["10.0.0.0/8".to_string()]), "198.51.100.9");
+    }
+
+    #[test]
+    fn trusted_peer_honors_forwarded_headers() {
+        let trusted = vec!["198.51.100.0/24".to_string()];
+        let req = req_with_headers(&[("cf-connecting-ip", "203.0.113.66")]);
+        assert_eq!(real_ip(&req, PEER, &trusted), "203.0.113.66");
+        let req = req_with_headers(&[("x-forwarded-for", "203.0.113.66, 10.0.0.2")]);
+        // leftmost entry is the original client, appended by the proxy.
+        assert_eq!(real_ip(&req, PEER, &trusted), "203.0.113.66");
+        // cf-connecting-ip takes precedence over x-forwarded-for.
+        let req = req_with_headers(&[
+            ("cf-connecting-ip", "203.0.113.66"),
+            ("x-forwarded-for", "198.51.100.200"),
+        ]);
+        assert_eq!(real_ip(&req, PEER, &trusted), "203.0.113.66");
+    }
+
+    #[test]
+    fn trusted_peer_ignores_garbage_forwarded_values() {
+        let trusted = vec!["198.51.100.0/24".to_string()];
+        let req = req_with_headers(&[
+            ("cf-connecting-ip", "not-an-ip"),
+            ("x-forwarded-for", "!!"),
+        ]);
+        assert_eq!(real_ip(&req, PEER, &trusted), "198.51.100.9");
+        let empty = req_with_headers(&[("cf-connecting-ip", ""), ("x-forwarded-for", " , ")]);
+        assert_eq!(real_ip(&empty, PEER, &trusted), "198.51.100.9");
+    }
+
+    #[test]
+    fn trusted_peer_match_is_exact_or_cidr() {
+        assert!(peer_is_trusted(&"198.51.100.9".parse().unwrap(), &["198.51.100.9".to_string()]));
+        assert!(!peer_is_trusted(&"198.51.100.9".parse().unwrap(), &["198.51.100.8".to_string()]));
+        assert!(peer_is_trusted(&"10.0.0.7".parse().unwrap(), &["10.0.0.0/8".to_string()]));
+        assert!(!peer_is_trusted(&"11.0.0.7".parse().unwrap(), &["10.0.0.0/8".to_string()]));
+        assert!(peer_is_trusted(&"10.0.0.7".parse().unwrap(), &["0.0.0.0/0".to_string()]));
+        assert!(peer_is_trusted(
+            &"2001:db8::1".parse().unwrap(),
+            &["2001:db8::/32".to_string()]
+        ));
+        assert!(!peer_is_trusted(
+            &"2001:db9::1".parse().unwrap(),
+            &["2001:db8::/32".to_string()]
+        ));
+        // garbage entries never match
+        assert!(!peer_is_trusted(&"10.0.0.7".parse().unwrap(), &["bogus".to_string()]));
+        assert!(!peer_is_trusted(&"10.0.0.7".parse().unwrap(), &["10.0.0.0/33".to_string()]));
+    }
+
+    #[test]
+    fn validate_trusted_proxy_accepts_ips_and_cidrs() {
+        assert!(validate_trusted_proxy("203.0.113.4").is_ok());
+        assert!(validate_trusted_proxy("10.0.0.0/8").is_ok());
+        assert!(validate_trusted_proxy("2001:db8::1").is_ok());
+        assert!(validate_trusted_proxy("2001:db8::/32").is_ok());
+        assert!(validate_trusted_proxy("203.0.113.4/33").is_err());
+        assert!(validate_trusted_proxy("203.0.113.4/xx").is_err());
+        assert!(validate_trusted_proxy("203.0.113.0/24/5").is_err());
+        assert!(validate_trusted_proxy("not-an-ip").is_err());
+        assert!(validate_trusted_proxy("").is_err());
     }
 }
