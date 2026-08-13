@@ -27,6 +27,7 @@ node_modules/
 # Internal / operational documents (not for distribution)
 memory-bank.md
 PROJECT_REPORT.md
+ARCHITECTURE_REPORT.md
 dbg-solver.mjs
 InstallationLog.txt
 

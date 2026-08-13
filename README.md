@@ -295,8 +295,8 @@ To reproduce:
 
 ```
 minesweeper-x64.exe --listen 31350
-python minesweeper_bot\ms_bench.py --all --sweep --games 800 --port 31350
-python minesweeper_bot\ms_fastest.py --port 31350 --games 200 --difficulty all
+python archive/minesweeper_bot/ms_bench.py --all --sweep --games 800 --port 31350
+python archive/minesweeper_bot/ms_fastest.py --port 31350 --games 200 --difficulty all
 ```
 
 ## Simulation / telemetry server (archive/server/)
@@ -372,9 +372,9 @@ broadcast games); the DB auto-migrates old databases by adding the
 Run the analysis client against any server:
 
 ```
-python server\ms_analyze.py --host 135.125.79.15 --port 28571 --difficulty expert --games 200
-python server\ms_analyze.py --host 127.0.0.1   --port 28571 --seed 987654 --difficulty expert --multi 15
-python server\ms_analyze.py --host 127.0.0.1   --port 28571 --seed 987654 --difficulty expert --until-loss
+python archive/server/ms_analyze.py --host 135.125.79.15 --port 28571 --difficulty expert --games 200
+python archive/server/ms_analyze.py --host 127.0.0.1   --port 28571 --seed 987654 --difficulty expert --multi 15
+python archive/server/ms_analyze.py --host 127.0.0.1   --port 28571 --seed 987654 --difficulty expert --until-loss
 ```
 
 The first asks for 200 random expert games; the second replays seed 987654
@@ -384,8 +384,8 @@ until the simulated player loses (exposing its risk profile).
 **Run it locally:**
 
 ```
-python server\selfcheck.py            # solver + live server + DB test
-python server\ms_server.py --port 28571 --rate 5
+python archive/server/selfcheck.py            # solver + live server + DB test
+python archive/server/ms_server.py --port 28571 --rate 5
 minesweeper-x64.exe --telemetry 127.0.0.1:28571
 ```
 
@@ -467,7 +467,7 @@ Never collected: files, browsing or network activity, credentials, IP
 geolocation, keystrokes, clipboard contents, screenshots, installed-software
 inventory, usernames or hostnames. Crash text is sanitized before it leaves
 the machine (`<user>\...`, `<install>\...`, `<redacted>\<module>`). On the
-server every row is stored as a single encrypted (Fernet) blob — no plaintext
+server every row is stored as a single encrypted (AES-GCM) blob — no plaintext
 fields are written to disk — and it can only be viewed through an
 authenticated, read-only admin page (`/ms-admin/` on the same HTTPS host).
 
