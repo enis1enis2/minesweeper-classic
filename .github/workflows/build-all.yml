@@ -50,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: linux
+          ref: main
       - name: Install X11 static libs
         run: |
           sudo apt-get update
@@ -78,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: linux
+          ref: main
       - name: Build (terminal + headless, no X11)
         working-directory: linux
         run: |
