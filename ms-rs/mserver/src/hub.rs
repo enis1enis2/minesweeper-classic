@@ -4,6 +4,7 @@
 use crate::config::NONCE_TTL;
 use crate::crypto::timing_safe_eq;
 use crate::db::{Database, now_sec};
+use futures::FutureExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, WriteHalf};
@@ -239,7 +240,17 @@ impl RequestWorkers {
                 let addr_for_task = addr.clone();
                 tokio::spawn(async move {
                     while let Some(line) = rx.recv().await {
-                        handler(addr_for_task.clone(), line).await;
+                        // One panicking request must not kill this client's
+                        // FIFO queue (and leak the channel entry in `states`).
+                        let result = std::panic::AssertUnwindSafe(handler(addr_for_task.clone(), line))
+                            .catch_unwind()
+                            .await;
+                        if let Err(panic) = result {
+                            eprintln!(
+                                "conn {}: panic in request handler: {:?}",
+                                addr_for_task, panic
+                            );
+                        }
                     }
                     // Channel closed (drop() called) -> reap the entry.
                     let mut m = states.lock().await;

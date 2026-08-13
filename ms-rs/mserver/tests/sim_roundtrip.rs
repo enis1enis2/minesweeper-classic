@@ -270,3 +270,46 @@ fn bad_auth_locks_out_when_each_attempt_reauths() {
     let mut probe = [0u8; 16];
     assert_eq!(client.stream.read(&mut probe).unwrap(), 0);
 }
+
+#[test]
+fn malformed_input_does_not_crash_server_or_affect_other_clients() {
+    let server = spawn_server("12345", "0");
+
+    // Client A fires a barrage of malformed / borderline protocol lines.
+    let mut a = Client::connect(server.port);
+    a.send("metric ");
+    a.send("auth");
+    a.send("authresp");
+    a.send("authresp deadbeef");
+    a.send("lbscore");
+    a.send("lbscore x nope 5");
+    a.send("lbscore mallory beginner nope");
+    a.send("lbscore mallory beginner 9999999999");
+    a.send("lbtop");
+    a.send("lbtop xyz 99999");
+    a.send("lbtop 999999");
+    a.send("lbtop 0");
+    a.send("reqseed");
+    a.send("reqseed beginner");
+    a.send("reqseed bogus 5");
+    a.send("reqseed beginner nope");
+    a.send("reqbatch beginner nope");
+    a.send("reqbatch beginner 0");
+    a.send("requntil intermediate -");
+    a.send("requntil expert");
+    a.send("   ");
+    a.send("\t\t");
+
+    // Client B is completely unaffected: auth + a full request round-trip.
+    let mut b = Client::connect(server.port);
+    auth(&mut b);
+    b.send("reqseed beginner 12345");
+    let lines = b.read_until("reqdone beginner 1", Duration::from_secs(30));
+    assert!(lines.contains(&"outcome beginner 12345 1 19 0 1".to_string()));
+
+    // Client A is still connected and fully usable too.
+    auth(&mut a);
+    a.send("reqseed beginner 12345");
+    let lines = a.read_until("reqdone beginner 1", Duration::from_secs(30));
+    assert!(lines.contains(&"outcome beginner 12345 1 19 0 1".to_string()));
+}

@@ -7,6 +7,7 @@ use crate::db::{Database, GameRow, now_sec};
 use crate::hub::{AdmissionGate, ClientHub, RequestWorkers};
 use crate::worker_pool::WorkerPool;
 use crate::worker::Task;
+use futures::FutureExt;
 use mscore::mt19937::Mt19937;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,17 +94,25 @@ struct SimOpts {
     rng_state: Option<(Vec<u32>, usize)>,
 }
 
-async fn simulate_game(server: &Server, diff: String, seed: u64, opts: SimOpts) -> (GameRow, Option<(Vec<u32>, usize)>) {
+async fn simulate_game(
+    server: &Server,
+    diff: String,
+    seed: u64,
+    opts: SimOpts,
+) -> Result<(GameRow, Option<(Vec<u32>, usize)>), String> {
     let task = Task {
         diff,
         seed,
         decision_seed: opts.decision_seed,
         rng_state: opts.rng_state,
     };
-    let mut msg = server.pool.submit(task).await.expect("worker pool submit");
+    let mut msg = server.pool.submit(task).await.map_err(|e| {
+        eprintln!("  simulate_game: worker pool error: {e}");
+        e
+    })?;
     msg.g.requester = opts.requester;
     server.db.record_game(&msg.g);
-    (msg.g, msg.rng_state)
+    Ok((msg.g, msg.rng_state))
 }
 
 fn split_tokens(line: &str) -> Vec<String> {
@@ -359,102 +368,133 @@ async fn handle_request(server: &Server, addr: &str, line: &str) {
             .await;
         server.gate.acquire().await;
     }
-    {
-        let mut batch_rng = match seed {
-            Some(s) => {
-                let mut r = Mt19937::new();
-                r.seed_u64(s.abs() as u64);
-                r
-            }
-            None => {
-                let mut r = Mt19937::new();
-                let mut words = [0u32; 624];
-                for w in words.iter_mut() {
-                    *w = rand::random();
-                }
-                r.seed_from_words(&words);
-                r
-            }
-        };
-        let mut played: u64 = 0;
-        let mut loss: Option<(u64, u64, u64, u64)> = None;
-        for run in 0..count {
-            let s = match seed {
-                Some(s) => s,
-                None => batch_rng.randrange(0, 1u64 << 63) as i128,
-            };
-            let s_wire = s.to_string();
-            let s_u64 = s as u64; // BigInt.asUintN(64): SimBoard.new stores the mask
-            // Random(seed) applies abs(); compute abs BEFORE the u64 cast so
-            // negative seeds seed the decision RNG like `Random(BigInt(...))`.
-            let decision = s ^ (run as i128) << 32;
-            let decision_seed = decision.unsigned_abs() as u64;
-            if !server.hub.send_to(addr, &format!("reqgame {} {}", diff, s_wire)).await {
-                break;
-            }
-            let (g, _) = simulate_game(
-                server,
-                diff.clone(),
-                s_u64,
-                SimOpts {
-                    requester: Some(addr.to_string()),
-                    decision_seed: Some(decision_seed),
-                    rng_state: None,
-                },
-            )
-            .await;
-            if !server.hub.send_to(addr, &format!("seed {} {}", diff, s_wire)).await {
-                break;
-            }
-            if !server.hub.send_to(addr, &outcome_line(&diff, &s_wire, &g)).await {
-                break;
-            }
-            played += 1;
-            if until && !g.won {
-                loss = Some((if g.won { 1 } else { 0 }, g.moves as u64, g.time_ms as u64, g.guesses as u64));
-                break;
-            }
-        }
-        if until {
-            match loss {
-                Some((w, moves, tms, guesses)) => {
-                    server
-                        .hub
-                        .send_to(
-                            addr,
-                            &format!(
-                                "lossfound {} {} {} {} {} {} {}",
-                                diff,
-                                seed.unwrap_or(0),
-                                played - 1,
-                                w,
-                                moves,
-                                tms,
-                                guesses
-                            ),
-                        )
-                        .await;
-                }
-                None => {
-                    server
-                        .hub
-                        .send_to(addr, &format!("noloss {} {} {}", diff, seed.unwrap_or(0), played))
-                        .await;
-                }
-            }
-        }
-        server
-            .hub
-            .send_to(addr, &format!("reqdone {} {}", diff, played))
-            .await;
-    }
+    let result = run_batch(server, addr, &diff, seed, count, until).await;
     if heavy {
         server.gate.release().await;
     }
+    if let Err(e) = result {
+        eprintln!("  conn {}: request {} failed: {}", addr, line, e);
+    }
+}
+
+/// Run one requested batch of games for a single client on its FIFO request
+/// worker. Returns Err on a server-side failure (worker pool down / client
+/// gone); the admission gate is released by `handle_request` regardless.
+async fn run_batch(
+    server: &Server,
+    addr: &str,
+    diff: &str,
+    seed: Option<i128>,
+    count: u64,
+    until: bool,
+) -> Result<(), String> {
+    let mut batch_rng = match seed {
+        Some(s) => {
+            let mut r = Mt19937::new();
+            r.seed_u64(s.abs() as u64);
+            r
+        }
+        None => {
+            let mut r = Mt19937::new();
+            let mut words = [0u32; 624];
+            for w in words.iter_mut() {
+                *w = rand::random();
+            }
+            r.seed_from_words(&words);
+            r
+        }
+    };
+    let mut played: u64 = 0;
+    let mut loss: Option<(u64, u64, u64, u64)> = None;
+    for run in 0..count {
+        let s = match seed {
+            Some(s) => s,
+            None => batch_rng.randrange(0, 1u64 << 63) as i128,
+        };
+        let s_wire = s.to_string();
+        let s_u64 = s as u64; // BigInt.asUintN(64): SimBoard.new stores the mask
+        // Random(seed) applies abs(); compute abs BEFORE the u64 cast so
+        // negative seeds seed the decision RNG like `Random(BigInt(...))`.
+        let decision = s ^ (run as i128) << 32;
+        let decision_seed = decision.unsigned_abs() as u64;
+        if !server
+            .hub
+            .send_to(addr, &format!("reqgame {} {}", diff, s_wire))
+            .await
+        {
+            return Err("client disconnected".into());
+        }
+        let (g, _) = simulate_game(
+            server,
+            diff.to_string(),
+            s_u64,
+            SimOpts {
+                requester: Some(addr.to_string()),
+                decision_seed: Some(decision_seed),
+                rng_state: None,
+            },
+        )
+        .await?;
+        if !server
+            .hub
+            .send_to(addr, &format!("seed {} {}", diff, s_wire))
+            .await
+        {
+            return Err("client disconnected".into());
+        }
+        if !server
+            .hub
+            .send_to(addr, &outcome_line(diff, &s_wire, &g))
+            .await
+        {
+            return Err("client disconnected".into());
+        }
+        played += 1;
+        if until && !g.won {
+            loss = Some((if g.won { 1 } else { 0 }, g.moves as u64, g.time_ms as u64, g.guesses as u64));
+            break;
+        }
+    }
+    if until {
+        match loss {
+            Some((w, moves, tms, guesses)) => {
+                server
+                    .hub
+                    .send_to(
+                        addr,
+                        &format!(
+                            "lossfound {} {} {} {} {} {} {}",
+                            diff,
+                            seed.unwrap_or(0),
+                            played - 1,
+                            w,
+                            moves,
+                            tms,
+                            guesses
+                        ),
+                    )
+                    .await;
+            }
+            None => {
+                server
+                    .hub
+                    .send_to(addr, &format!("noloss {} {} {}", diff, seed.unwrap_or(0), played))
+                    .await;
+            }
+        }
+    }
+    server
+        .hub
+        .send_to(addr, &format!("reqdone {} {}", diff, played))
+        .await;
+    Ok(())
 }
 
 /// The shared decision-RNG producer: broadcasts games to all connected
-/// clients at the configured rate (port of `produce()`).
+/// clients at the configured rate (port of `produce()`). The per-game body is
+/// wrapped in catch_unwind so a panic anywhere inside one broadcast (e.g. a
+/// transient DB failure) cannot kill the producer and silently stop the
+/// telemetry stream.
 pub async fn produce(server: Arc<Server>, rng: Arc<TokioMutex<Mt19937>>) {
     while !server.stop.load(Ordering::SeqCst) {
         while server.hub.count().await == 0 && !server.stop.load(Ordering::SeqCst) {
@@ -463,32 +503,48 @@ pub async fn produce(server: Arc<Server>, rng: Arc<TokioMutex<Mt19937>>) {
         if server.stop.load(Ordering::SeqCst) {
             break;
         }
-        let (diff, seed, snapshot) = {
-            let mut r = rng.lock().await;
-            let diff = r.choice(&server.diffs);
-            let seed = r.randrange(0, 1u64 << 63);
-            let snapshot = r.snapshot();
-            (diff, seed, snapshot)
-        };
-        let (g, rng_state) = simulate_game(
-            &server,
-            diff.clone(),
-            seed,
-            SimOpts {
-                requester: None,
-                decision_seed: None,
-                rng_state: Some(snapshot),
-            },
-        )
-        .await;
-        if let Some(st) = rng_state {
-            let mut r = rng.lock().await;
-            r.restore(&st.0, st.1);
-        }
-        server.hub.broadcast(&format!("seed {} {}", diff, seed)).await;
-        server.hub.broadcast(&outcome_line(&diff, &seed.to_string(), &g)).await;
+        let _ = std::panic::AssertUnwindSafe(produce_one(&server, &rng))
+            .catch_unwind()
+            .await;
         if server.rate > 0.0 {
             tokio::time::sleep(Duration::from_millis((1000.0 / server.rate) as u64)).await;
+        }
+    }
+}
+
+async fn produce_one(server: &Server, rng: &Arc<TokioMutex<Mt19937>>) {
+    let (diff, seed, snapshot) = {
+        let mut r = rng.lock().await;
+        let diff = r.choice(&server.diffs);
+        let seed = r.randrange(0, 1u64 << 63);
+        let snapshot = r.snapshot();
+        (diff, seed, snapshot)
+    };
+    match simulate_game(
+        server,
+        diff.clone(),
+        seed,
+        SimOpts {
+            requester: None,
+            decision_seed: None,
+            rng_state: Some(snapshot),
+        },
+    )
+    .await
+    {
+        Ok((g, rng_state)) => {
+            if let Some(st) = rng_state {
+                let mut r = rng.lock().await;
+                r.restore(&st.0, st.1);
+            }
+            server.hub.broadcast(&format!("seed {} {}", diff, seed)).await;
+            server
+                .hub
+                .broadcast(&outcome_line(&diff, &seed.to_string(), &g))
+                .await;
+        }
+        Err(e) => {
+            eprintln!("  produce: simulate failed: {}", e);
         }
     }
 }

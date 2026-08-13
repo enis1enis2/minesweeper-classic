@@ -20,6 +20,7 @@ scrypt = "0.11"
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
+futures = "0.3"
 eframe = "0.29"
 egui = "0.29"
 
@@ -27,4 +28,3 @@ egui = "0.29"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"

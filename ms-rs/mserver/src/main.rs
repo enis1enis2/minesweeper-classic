@@ -19,6 +19,7 @@ use crate::db::Database;
 use crate::hub::{AdmissionGate, ClientHub, RequestWorkers};
 use crate::protocol::{Server, handle_conn, produce};
 use crate::worker_pool::WorkerPool;
+use futures::FutureExt;
 use mscore::mt19937::Mt19937;
 use std::env;
 use std::net::SocketAddr;
@@ -284,7 +285,14 @@ async fn main() {
                     let addr = fmt_peer(&peer);
                     let srv = Arc::clone(&accept_server);
                     tokio::spawn(async move {
-                        handle_conn(srv, stream, addr).await;
+                        // One panic in a connection's handler must never take
+                        // down the listener loop or other connections.
+                        if let Err(panic) = std::panic::AssertUnwindSafe(handle_conn(srv, stream, addr.clone()))
+                            .catch_unwind()
+                            .await
+                        {
+                            eprintln!("conn {}: panic in connection handler: {:?}", addr, panic);
+                        }
                     });
                 }
                 Err(_) => {
