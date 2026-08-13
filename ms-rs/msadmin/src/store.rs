@@ -67,7 +67,7 @@ impl DiagDB {
         let cutoff = crate::http::unix_now() - 24 * 3600;
         let recent: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM device_diagnostics WHERE ts > ?1",
+                "SELECT COUNT(*) FROM device_diagnostics WHERE ts >= ?1",
                 [cutoff],
                 |r| r.get(0),
             )
@@ -78,7 +78,7 @@ impl DiagDB {
     pub fn recent_rows(&self, limit: usize) -> Vec<(i64, i64, String, Vec<u8>)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT ts, id, addr, blob FROM device_diagnostics ORDER BY ts DESC LIMIT ?1",
+            "SELECT id, ts, addr, blob FROM device_diagnostics ORDER BY id DESC LIMIT ?1",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -107,7 +107,6 @@ pub struct AuthStore {
     sessions: HashMap<String, (i64, String)>,
     epoch: u64,
     failures: HashMap<String, Vec<i64>>,
-    locked_until: HashMap<String, i64>,
 }
 
 impl AuthStore {
@@ -135,33 +134,40 @@ impl AuthStore {
             sessions: HashMap::new(),
             epoch: 0,
             failures: HashMap::new(),
-            locked_until: HashMap::new(),
         })
     }
 
     fn prune(&mut self, now: i64) {
         self.sessions.retain(|_, (expires, _)| *expires > now);
         self.failures.retain(|_, list| {
-            list.retain(|t| *t > now - FAILURE_WINDOW_SECS);
+            list.retain(|t| *t >= now - FAILURE_WINDOW_SECS);
             !list.is_empty()
         });
-        self.locked_until.retain(|_, until| *until > now);
     }
 
-    fn record_failure(&mut self, now: i64, ip: &str) {
-        let list = self.failures.entry(ip.to_string()).or_default();
-        list.push(now);
-        list.retain(|t| *t > now - FAILURE_WINDOW_SECS);
+    // Mirrors store.js lockedUntil(ip): lock once >= 5 failures land in the
+    // 900s window; returns the epoch when the lock expires (0 when unlocked).
+    pub fn locked_until(&mut self, now: i64, ip: &str) -> i64 {
+        self.prune(now);
+        let list = self.failures.get(ip).cloned().unwrap_or_default();
         if list.len() >= MAX_FAILURES {
-            if let Some(last) = list.last() {
-                self.locked_until.insert(ip.to_string(), last + FAILURE_WINDOW_SECS);
+            if let Some(&last) = list.last() {
+                return last + FAILURE_WINDOW_SECS;
             }
         }
+        0
+    }
+
+    // Mirrors store.js recordFailure(ip); called by the login handler after
+    // any failed checkLogin (including a locked-out attempt).
+    pub fn record_failure(&mut self, now: i64, ip: &str) {
+        let list = self.failures.entry(ip.to_string()).or_default();
+        list.push(now);
+        list.retain(|t| *t >= now - FAILURE_WINDOW_SECS);
     }
 
     fn clear_failures(&mut self, ip: &str) {
         self.failures.remove(ip);
-        self.locked_until.remove(ip);
     }
 
     pub fn check_login(
@@ -173,20 +179,16 @@ impl AuthStore {
         code: &str,
     ) -> LoginResult {
         self.prune(now);
-        let locked = *self.locked_until.get(ip).unwrap_or(&0);
-        if locked > now {
+        if self.locked_until(now, ip) > 0 {
             return LoginResult { ok: false, reason: "too many failed attempts (locked out)" };
         }
         if !safe_equal(username, &self.username) {
-            self.record_failure(now, ip);
             return LoginResult { ok: false, reason: "invalid credentials" };
         }
         if !verify_password(&self.password_hash, password) {
-            self.record_failure(now, ip);
             return LoginResult { ok: false, reason: "invalid credentials" };
         }
         if !totp_verify(&self.totp_secret_b32, code, 1, now) {
-            self.record_failure(now, ip);
             return LoginResult { ok: false, reason: "invalid TOTP code" };
         }
         self.clear_failures(ip);
@@ -303,7 +305,9 @@ mod tests {
             let r = auth.check_login(now, "9.9.9.9", "admin", "wrong-password", "000000");
             assert!(!r.ok);
             assert_eq!(r.reason, "invalid credentials");
+            auth.record_failure(now, "9.9.9.9");
         }
+        assert!(auth.locked_until(now, "9.9.9.9") > now);
         let r = auth.check_login(now, "9.9.9.9", "admin", pw, "000000");
         assert!(!r.ok);
         assert_eq!(r.reason, "too many failed attempts (locked out)");

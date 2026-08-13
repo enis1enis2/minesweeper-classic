@@ -17,30 +17,16 @@ const COOKIE_NAME: &str = "ms_admin";
 const VIEWER_ROWS: usize = 200;
 const MAX_HEADER_BYTES: usize = 65536;
 
+// Mirror of Node server.js EXPECTED_FIELDS.
 const EXPECTED_FIELDS: &[&str] = &[
     "machine_id",
-    "public_ip",
-    "private_ip",
-    "network_interface",
-    "router_ip",
-    "local_gateway",
-    "dns_servers",
-    "region",
-    "hostname",
-    "os_version",
-    "server_version",
-    "version",
-    "lang",
-    "country_code",
-    "timezone",
-    "last_boot",
-    "total_disk_gb",
-    "used_disk_gb",
-    "total_ram_gb",
-    "used_ram_gb",
-    "cpu_model",
+    "os",
+    "cpu",
     "cpu_cores",
+    "gpu",
     "ram_mb",
+    "display",
+    "game_version",
     "uptime_sec",
     "crash_text",
 ];
@@ -88,7 +74,6 @@ fn reason(code: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
-        405 => "Method Not Allowed",
         413 => "Payload Too Large",
         423 => "Locked",
         429 => "Too Many Requests",
@@ -114,16 +99,33 @@ pub fn not_found() -> HttpResponse {
     simple(404, "not found\n", "text/plain; charset=utf-8")
 }
 
-fn method_not_allowed() -> HttpResponse {
-    simple(405, "method not allowed\n", "text/plain; charset=utf-8")
+// Node server.js sendJson(): {"ok":false,"error":"..."}\n with
+// Content-Type: application/json.
+fn send_json_error(code: u16, error: &str) -> HttpResponse {
+    HttpResponse {
+        code,
+        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        body: format!("{{\"ok\":false,\"error\":\"{error}\"}}\n").into_bytes(),
+    }
 }
 
-fn too_many_requests() -> HttpResponse {
-    simple(429, "rate limit exceeded\n", "text/plain; charset=utf-8")
+// Node server.js sendJson(res, 200, {ok:true}) — no id field.
+fn ok_json() -> HttpResponse {
+    HttpResponse {
+        code: 200,
+        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        body: b"{\"ok\":true}\n".to_vec(),
+    }
 }
 
+// Node send() for redirects sets Content-Type: text/plain; charset=utf-8
+// before the extra headers (Location, Set-Cookie).
 fn redirect(location: &str, extra: Vec<(String, String)>) -> HttpResponse {
-    let mut headers = vec![("Location".to_string(), location.to_string())];
+    let mut headers = vec![(
+        "Content-Type".to_string(),
+        "text/plain; charset=utf-8".to_string(),
+    )];
+    headers.push(("Location".to_string(), location.to_string()));
     headers.extend(extra);
     HttpResponse {
         code: 302,
@@ -135,9 +137,7 @@ fn redirect(location: &str, extra: Vec<(String, String)>) -> HttpResponse {
 fn set_cookie(token: &str) -> (String, String) {
     (
         "Set-Cookie".to_string(),
-        format!(
-            "{COOKIE_NAME}={token}; Path=/ms-admin/; HttpOnly; Secure; SameSite=Lax"
-        ),
+        format!("{COOKIE_NAME}={token}; Path=/ms-admin/; HttpOnly; Secure; SameSite=Lax"),
     )
 }
 
@@ -150,6 +150,7 @@ fn clear_cookie() -> (String, String) {
     )
 }
 
+// Node server.js escapeHtml(): ' becomes &#x27;.
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -158,112 +159,161 @@ pub fn escape_html(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
+            '\'' => out.push_str("&#x27;"),
             _ => out.push(c),
         }
     }
     out
 }
 
+// Node server.js page(title, body) — byte-for-byte HTML shell.
 fn page(title: &str, body: &str) -> HttpResponse {
     let html = format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>{title}</title><style>
-body {{ font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 16px; }}
-h1 {{ color: #f0f6fc; }}
-a {{ color: #58a6ff; }}
-table {{ border-collapse: collapse; width: 100%; margin-top: 16px; font-size: 14px; }}
-th, td {{ border: 1px solid #30363d; padding: 6px 10px; text-align: left; vertical-align: top; }}
-th {{ background: #161b22; color: #8b949e; }}
-tr:nth-child(even) {{ background: #161b22; }}
-input, button {{ font: inherit; padding: 6px 10px; margin: 4px 0; border: 1px solid #30363d; border-radius: 6px; background: #21262d; color: #c9d1d9; }}
-button {{ cursor: pointer; }}
-button:hover {{ background: #30363d; }}
-.notice {{ color: #ff7b72; }}
-.inline {{ display: inline; }}
-</style></head>\n<body>\n{body}\n</body>\n</html>\n"
+        "<!doctype html><html><head><meta charset='utf-8'><title>{}</title><style>\
+body{{font-family:system-ui,sans-serif;margin:2rem;color:#1c1c1c;background:#f7f7f7}}\
+h1{{font-size:1.25rem}}.card{{background:#fff;border:1px solid #ddd;border-radius:6px;padding:1rem;margin:1rem 0}}\
+table{{border-collapse:collapse;width:100%;font-size:0.85rem}}\
+th,td{{border:1px solid #e3e3e3;padding:4px 8px;text-align:left}}\
+th{{background:#efefef}}pre{{white-space:pre-wrap;word-break:break-all;max-width:60ch;margin:0;font-size:0.8rem}}\
+label{{display:block;margin:.5rem 0 .15rem}}input{{width:20rem}}\
+button,form{{display:inline;margin-right:.5rem}}\
+.mono{{font-family:ui-monospace,monospace}}\
+</style></head><body>{}</body></html>",
+        escape_html(title),
+        body
     );
     simple(200, &html, "text/html; charset=utf-8")
 }
 
-fn login_page(notice: &str) -> HttpResponse {
-    let notice_html = if notice.is_empty() {
-        String::new()
-    } else {
-        format!("<p class=\"notice\">{}</p>", escape_html(notice))
-    };
+// Node server.js loginPage(notice); code is 401 (bad creds) or 423 (locked).
+fn login_page(notice: &str, code: u16) -> HttpResponse {
     let body = format!(
-        "<h1>Minesweeper Diagnostics</h1>\n{notice_html}\n\
-<form method=\"post\" action=\"/ms-admin/login\">\n\
-<label>Username <input type=\"text\" name=\"username\" required autocomplete=\"username\"></label>\n\
-<label>Password <input type=\"password\" name=\"password\" required autocomplete=\"current-password\"></label>\n\
-<label>2FA code <input type=\"text\" name=\"totp\" inputmode=\"numeric\" autocomplete=\"one-time-code\"></label>\n\
-<button type=\"submit\">Sign in</button>\n\
-</form>\n"
+        "<h1>Minesweeper diagnostics admin</h1><p>{}</p>\
+<form method='POST' action='/ms-admin/login'>\
+<label>Username</label><input type='text' name='username' autocomplete='username'>\
+<label>Password</label><input type='password' name='password' autocomplete='current-password'>\
+<label>TOTP code</label><input type='text' name='totp' autocomplete='one-time-code' inputmode='numeric' pattern='[0-9]{{6}}' maxlength='6'>\
+<br><br><button type='submit'>Sign in</button></form>",
+        escape_html(notice)
     );
-    let mut res = page("Minesweeper Diagnostics", &body);
-    res.code = 401;
+    let mut res = page("Sign in", &body);
+    res.code = code;
     res
 }
 
+// JS Number(x) string coercion, matching the viewer's Number(d.ram_mb ?? 0)
+// and Number(d.uptime_sec ?? 0) rendering.
+fn js_number(v: &Value) -> String {
+    let f = match v {
+        Value::Null => 0.0,
+        Value::Bool(b) => return if *b { "1".to_string() } else { "0".to_string() },
+        Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+        Value::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
+        _ => f64::NAN,
+    };
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    format!("{}", f)
+}
+
+// JS String(v) for the viewer's String(d.os ?? "")-style coercions.
+fn str_coerce(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Number(_) => js_number(v),
+        Value::Bool(b) => b.to_string(),
+        _ => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
+
+// JS truthiness for the viewer's `d.crash_text || ""`.
+fn js_crash(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Number(n) => {
+            let f = n.as_f64().unwrap_or(0.0);
+            if f == 0.0 {
+                String::new()
+            } else {
+                js_number(v)
+            }
+        }
+        Value::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+// Node server.js viewerPage(state, ip).
 fn viewer_page(state: &State, ip: &str) -> HttpResponse {
     let (total, recent) = state.db.stats();
     let rows = state.db.recent_rows(VIEWER_ROWS);
-    let mut table = String::new();
-    for (ts, _id, addr, blob) in rows {
-        let doc: Value = match crypt::decrypt(&state.key, &blob)
-            .and_then(|p| serde_json::from_slice::<Value>(&p).map_err(|e| e.to_string()))
-        {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let get = |k: &str| doc.get(k).cloned().unwrap_or(Value::Null);
-        let machine_id = get("machine_id")
-            .as_str()
-            .unwrap_or("")
-            .chars()
-            .take(16)
-            .collect::<String>();
-        let ram_mb = number_str(&get("ram_mb"));
-        let uptime_sec = number_str(&get("uptime_sec"));
-        let cpu_cores = number_str(&get("cpu_cores"));
-        let crash = match get("crash_text") {
-            Value::String(s) if !s.is_empty() => s,
-            _ => String::new(),
-        };
-        table.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{} <em>({})</em></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
-            utc_ts(ts),
-            escape_html(&addr),
-            escape_html(&machine_id),
-            escape_html(&addr),
-            escape_html(&cpu_cores),
-            escape_html(&ram_mb),
-            escape_html(&uptime_sec),
-            escape_html(&crash),
-        ));
-    }
-    let body = format!(
-        "<h1>Minesweeper Diagnostics</h1>\n\
-<p>Signed in from: {ip}</p>\n\
-<p>Total diagnostics: {total} &mdash; last 24h: {recent}</p>\n\
-<form action=\"/ms-admin/logout\" method=\"post\" class=\"inline\"><button type=\"submit\">Log out</button></form>\n\
-<form action=\"/ms-admin/revoke-all\" method=\"post\" class=\"inline\"><button type=\"submit\">Revoke all sessions</button></form>\n\
-<table>\n\
-<thead><tr><th>Time (UTC)</th><th>Node</th><th>Machine ID</th><th>CPU (cores)</th><th>RAM (MB)</th><th>Uptime (s)</th><th>Crash</th></tr></thead>\n\
-<tbody>\n{table}\
-</tbody>\n\
-</table>\n"
+    let mut cards = format!(
+        "<div class='card'><b>{total}</b> total rows &middot; <b>{recent}</b> in the last 24h &middot; signed in from <span class='mono'>{}</span></div>",
+        escape_html(ip)
     );
-    page("Minesweeper Diagnostics", &body)
-}
-
-fn number_str(v: &Value) -> String {
-    match v {
-        Value::Number(n) => n.to_string(),
-        _ => "0".to_string(),
+    if rows.is_empty() {
+        cards.push_str("<div class='card'>No diagnostics yet.</div>");
+    } else {
+        cards.push_str(
+            "<table><tr><th>id</th><th>when (UTC)</th><th>addr</th><th>machine</th>\
+<th>os</th><th>cpu</th><th>gpu</th><th>ram</th><th>display</th>\
+<th>game</th><th>uptime</th><th>crash</th></tr>",
+        );
+        for (rid, ts, addr, blob) in rows {
+            let doc: Option<Value> = crypt::decrypt(&state.key, &blob)
+                .ok()
+                .and_then(|p| serde_json::from_slice::<Value>(&p).ok());
+            match doc {
+                None => {
+                    cards.push_str(&format!(
+                        "<tr><td>{rid}</td><td>{}</td><td>{}</td><td colspan='9'>unable to decrypt (key mismatch?)</td></tr>",
+                        utc_ts(ts),
+                        escape_html(&addr)
+                    ));
+                }
+                Some(d) => {
+                    let machine: String =
+                        escape_html(&str_coerce(d.get("machine_id").unwrap_or(&Value::Null)))
+                            .chars()
+                            .take(16)
+                            .collect();
+                    let os = escape_html(&str_coerce(d.get("os").unwrap_or(&Value::Null)));
+                    let cpu = escape_html(&str_coerce(d.get("cpu").unwrap_or(&Value::Null)));
+                    let gpu = escape_html(&str_coerce(d.get("gpu").unwrap_or(&Value::Null)));
+                    let ram = js_number(&d.get("ram_mb").unwrap_or(&Value::Null));
+                    let display =
+                        escape_html(&str_coerce(d.get("display").unwrap_or(&Value::Null)));
+                    let game =
+                        escape_html(&str_coerce(d.get("game_version").unwrap_or(&Value::Null)));
+                    let uptime = js_number(&d.get("uptime_sec").unwrap_or(&Value::Null));
+                    let crash = escape_html(&js_crash(&d.get("crash_text").unwrap_or(&Value::Null)));
+                    cards.push_str(&format!(
+                        "<tr><td>{rid}</td><td>{}</td><td>{}</td><td class='mono'>{machine}</td><td>{os}</td><td>{cpu}</td><td>{gpu}</td><td>{ram}</td><td>{display}</td><td>{game}</td><td>{uptime}s</td><td><pre>{crash}</pre></td></tr>",
+                        utc_ts(ts),
+                        escape_html(&addr)
+                    ));
+                }
+            }
+        }
+        cards.push_str("</table>");
     }
+    let actions = "<form method='POST' action='/ms-admin/logout'>\
+<button type='submit'>Log out</button></form>\
+<form method='POST' action='/ms-admin/revoke-all'>\
+<button type='submit' onclick=\"return confirm('Revoke all sessions?');\">\
+Revoke all sessions</button></form>\
+<a href='/ms-admin/'>Refresh</a>";
+    let body = format!("<h1>Minesweeper diagnostics</h1>{actions}{cards}");
+    page("Diagnostics", &body)
 }
 
 fn utc_ts(secs: i64) -> String {
@@ -294,8 +344,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 fn real_ip(req: &HttpRequest, peer: std::net::SocketAddr) -> String {
     if let Some(v) = req.header("cf-connecting-ip") {
-        if !v.is_empty() {
-            return v.to_string();
+        let first = v.split(',').next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return first.to_string();
         }
     }
     if let Some(v) = req.header("x-forwarded-for") {
@@ -327,17 +378,13 @@ fn require_session(state: &State, req: &HttpRequest) -> Option<String> {
     auth.validate(unix_now(), &token)
 }
 
+// Node readBody() + JSON.parse: body bytes are decoded lossily, so invalid
+// UTF-8 simply becomes garbage JSON ("bad json"), never a separate error.
 fn parse_body(req: &HttpRequest) -> Result<String, u16> {
     if req.body_too_large {
         return Err(413);
     }
-    if req.body.is_empty() {
-        return Ok(String::new());
-    }
-    match String::from_utf8(req.body.clone()) {
-        Ok(s) => Ok(s),
-        Err(_) => Err(400),
-    }
+    Ok(String::from_utf8_lossy(&req.body).into_owned())
 }
 
 fn decode_uri_component(s: &str) -> String {
@@ -392,89 +439,99 @@ fn parse_urlencoded(body: &str) -> HashMap<String, String> {
     fields
 }
 
+fn is_integer(v: &Value) -> bool {
+    match v {
+        Value::Number(n) => {
+            n.is_i64() || n.is_u64() || n.as_f64().map(|f| f.fract() == 0.0).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+// Mirror JS JSON.stringify for numbers: an f64 with a zero fraction
+// serializes as an integer ("4.0" -> "4").
+fn normalize_number(v: &Value) -> Value {
+    match v {
+        Value::Number(n) if n.is_f64() => {
+            if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0
+                    && f.is_finite()
+                    && f >= i64::MIN as f64
+                    && f <= i64::MAX as f64
+                {
+                    return Value::from(f as i64);
+                }
+            }
+            v.clone()
+        }
+        _ => v.clone(),
+    }
+}
+
 fn handle_ingest(state: &State, req: &HttpRequest, ip: &str) -> HttpResponse {
+    let now = unix_now();
     {
         let mut counts = state.ingest.lock().unwrap();
-        let now = unix_now();
         counts.retain(|t| *t > now - INGEST_WINDOW_SECS);
         if counts.len() >= INGEST_LIMIT {
-            return too_many_requests();
+            return send_json_error(429, "rate limited");
         }
         counts.push(now);
     }
     let body = match parse_body(req) {
         Ok(b) => b,
-        Err(code) => {
-            if code == 413 {
-                return simple(413, "payload too large\n", "text/plain; charset=utf-8");
-            }
-            return simple(400, "invalid body\n", "text/plain; charset=utf-8");
-        }
+        Err(_) => return send_json_error(413, "payload too large"),
     };
     if body.is_empty() {
-        return simple(400, "empty body\n", "text/plain; charset=utf-8");
-    }
-    if req.body.len() > MAX_BODY {
-        return simple(413, "payload too large\n", "text/plain; charset=utf-8");
+        return send_json_error(400, "empty body");
     }
     let mut doc: Value = match serde_json::from_str(&body) {
-        Ok(v @ Value::Object(_)) => v,
-        Ok(_) => return simple(400, "invalid JSON\n", "text/plain; charset=utf-8"),
-        Err(_) => return simple(400, "invalid JSON\n", "text/plain; charset=utf-8"),
+        Ok(v) => v,
+        Err(_) => return send_json_error(400, "bad json"),
     };
+    if !doc.is_object() {
+        return send_json_error(400, "expected object");
+    }
+    let obj = doc.as_object_mut().unwrap();
     for field in EXPECTED_FIELDS {
-        if !doc.get(*field).is_some() {
-            return simple(400, &format!("missing field: {field}\n"), "text/plain; charset=utf-8");
+        if !obj.contains_key(*field) {
+            return send_json_error(400, &format!("missing field {field}"));
         }
     }
-    match doc.get_mut("crash_text") {
+    match obj.get_mut("crash_text") {
         Some(v) if v.is_string() || v.is_null() => {}
         _ => {
-            doc["crash_text"] = Value::Null;
+            obj.insert("crash_text".to_string(), Value::Null);
         }
     }
     for field in INTEGER_FIELDS {
         if !is_integer(&doc[*field]) {
-            return simple(400, &format!("invalid field: {field}\n"), "text/plain; charset=utf-8");
+            return send_json_error(400, &format!("bad field {field}"));
         }
     }
+    // serde_json's Map sorts keys (BTreeMap), matching Object.keys(doc).sort().
     let mut sorted = Map::new();
-    let mut keys: Vec<&str> = doc.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    keys.sort();
-    for k in keys {
-        sorted.insert(k.to_string(), doc[k].clone());
+    for (k, v) in doc.as_object().unwrap() {
+        sorted.insert(k.clone(), normalize_number(v));
     }
     let plain = match serde_json::to_string(&Value::Object(sorted)) {
         Ok(s) => s,
-        Err(_) => return simple(500, "serialize failed\n", "text/plain; charset=utf-8"),
+        Err(_) => return send_json_error(500, "server error"),
     };
     let blob = match crypt::encrypt(&state.key, plain.as_bytes()) {
         Ok(b) => b,
-        Err(_) => return simple(500, "encrypt failed\n", "text/plain; charset=utf-8"),
+        Err(_) => return send_json_error(500, "server error"),
     };
-    let ts = unix_now();
-    let id = match state.db.insert(ts, ip, &blob) {
-        Ok(id) => id,
-        Err(_) => return simple(500, "insert failed\n", "text/plain; charset=utf-8"),
-    };
-    HttpResponse {
-        code: 200,
-        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
-        body: format!(r#"{{"ok":true,"id":{id}}}"#).into_bytes(),
+    if state.db.insert(now, ip, &blob).is_err() {
+        return send_json_error(500, "server error");
     }
-}
-
-fn is_integer(v: &Value) -> bool {
-    match v {
-        Value::Number(n) => n.is_i64() || n.is_u64() || n.as_f64().map(|f| f.fract() == 0.0).unwrap_or(false),
-        _ => false,
-    }
+    ok_json()
 }
 
 fn handle_admin(state: &State, req: &HttpRequest) -> HttpResponse {
     let session_ip = match require_session(state, req) {
         Some(ip) => ip,
-        None => return login_page(""),
+        None => return login_page("Please sign in.", 401),
     };
     if req.path != "/ms-admin/" {
         return not_found();
@@ -483,9 +540,18 @@ fn handle_admin(state: &State, req: &HttpRequest) -> HttpResponse {
 }
 
 fn handle_login(state: &State, req: &HttpRequest, ip: &str) -> HttpResponse {
+    let now = unix_now();
+    let lock_until = {
+        let mut auth = state.auth.lock().unwrap();
+        auth.locked_until(now, ip)
+    };
+    if lock_until > 0 {
+        let retry = (lock_until - now).max(1);
+        return login_page(&format!("Too many failed attempts. Retry in ~{retry}s."), 423);
+    }
     let body = match parse_body(req) {
         Ok(b) => b,
-        Err(_) => return login_page("invalid request"),
+        Err(_) => String::new(),
     };
     let fields = parse_urlencoded(&body);
     let username = fields.get("username").cloned().unwrap_or_default();
@@ -493,14 +559,16 @@ fn handle_login(state: &State, req: &HttpRequest, ip: &str) -> HttpResponse {
     let code = fields.get("totp").cloned().unwrap_or_default();
     let result = {
         let mut auth = state.auth.lock().unwrap();
-        auth.check_login(unix_now(), ip, &username, &password, &code)
+        auth.check_login(now, ip, &username, &password, &code)
     };
     if !result.ok {
-        return login_page(result.reason);
+        let mut auth = state.auth.lock().unwrap();
+        auth.record_failure(now, ip);
+        return login_page("Invalid credentials.", 401);
     }
     let (token, _expires) = {
         let mut auth = state.auth.lock().unwrap();
-        auth.issue_session(unix_now(), ip)
+        auth.issue_session(now, ip)
     };
     redirect("/ms-admin/", vec![set_cookie(&token)])
 }
@@ -513,10 +581,17 @@ fn handle_logout(state: &State, req: &HttpRequest) -> HttpResponse {
     redirect("/ms-admin/", vec![clear_cookie()])
 }
 
-fn handle_revoke_all(state: &State, _req: &HttpRequest) -> HttpResponse {
-    let mut auth = state.auth.lock().unwrap();
-    auth.revoke_all();
-    redirect("/ms-admin/", Vec::new())
+fn handle_revoke_all(state: &State, req: &HttpRequest) -> HttpResponse {
+    let session_ip = match require_session(state, req) {
+        Some(ip) => ip,
+        None => return login_page("Please sign in.", 401),
+    };
+    {
+        let mut auth = state.auth.lock().unwrap();
+        auth.revoke_all();
+    }
+    println!("revoke-all issued by ip={session_ip}");
+    redirect("/ms-admin/", vec![clear_cookie()])
 }
 
 pub fn route(state: &State, method: &str, path: &str, req: &HttpRequest, ip: &str) -> HttpResponse {
@@ -538,14 +613,10 @@ pub fn route(state: &State, method: &str, path: &str, req: &HttpRequest, ip: &st
             _ => return not_found(),
         }
     }
-    method_not_allowed()
+    simple(501, "Unsupported method\n", "text/plain; charset=utf-8")
 }
 
-async fn write_response(
-    stream: &mut TcpStream,
-    res: &HttpResponse,
-    head_only: bool,
-) -> std::io::Result<()> {
+async fn write_response(stream: &mut TcpStream, res: &HttpResponse) -> std::io::Result<()> {
     let mut head = format!("HTTP/1.1 {} {}\r\n", res.code, reason(res.code));
     let mut has_length = false;
     for (name, value) in &res.headers {
@@ -560,7 +631,7 @@ async fn write_response(
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await?;
-    if !head_only && !res.body.is_empty() {
+    if !res.body.is_empty() {
         stream.write_all(&res.body).await?;
     }
     stream.flush().await?;
@@ -613,7 +684,9 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<HttpRequ
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
+    let raw_path = parts.next().unwrap_or("").to_string();
+    // Node routes on req.url.split("?", 1)[0].
+    let path = raw_path.split('?').next().unwrap_or("").to_string();
     if method.is_empty() || path.is_empty() {
         return Ok(None);
     }
@@ -711,16 +784,19 @@ pub async fn handle_conn(state: Arc<State>, mut stream: TcpStream) -> std::io::R
         Ok(Ok(Some(req))) => req,
         Ok(Ok(None)) => return Ok(()),
         Ok(Err(_)) => {
-            let _ = write_response(&mut stream, &simple(400, "bad request\n", "text/plain; charset=utf-8"), false).await;
+            let _ = write_response(
+                &mut stream,
+                &simple(400, "bad request\n", "text/plain; charset=utf-8"),
+            )
+            .await;
             return Ok(());
         }
         Err(_) => return Ok(()),
     };
     let ip = real_ip(&request, peer);
     println!("{ip} {} {}", request.method, request.path);
-    let head_only = request.method == "HEAD";
     let response = route(&state, &request.method, &request.path, &request, &ip);
-    write_response(&mut stream, &response, head_only).await
+    write_response(&mut stream, &response).await
 }
 
 #[cfg(test)]
@@ -754,5 +830,22 @@ mod tests {
         assert!(!is_integer(&Value::from(4.5)));
         assert!(!is_integer(&Value::from("4")));
         assert!(!is_integer(&Value::Null));
+    }
+
+    #[test]
+    fn js_number_matches_js_rendering() {
+        assert_eq!(js_number(&Value::from(4096)), "4096");
+        assert_eq!(js_number(&Value::from(4096.0)), "4096");
+        assert_eq!(js_number(&Value::Null), "0");
+        assert_eq!(js_number(&Value::from("4096")), "4096");
+        assert_eq!(js_number(&Value::from("abc")), "NaN");
+        assert_eq!(js_number(&Value::Bool(true)), "1");
+    }
+
+    #[test]
+    fn normalize_number_handles_integral_floats() {
+        assert_eq!(normalize_number(&Value::from(4.0)), Value::from(4));
+        assert_eq!(normalize_number(&Value::from(4.5)), Value::from(4.5));
+        assert_eq!(normalize_number(&Value::from(4)), Value::from(4));
     }
 }

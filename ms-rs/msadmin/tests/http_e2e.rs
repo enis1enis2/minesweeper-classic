@@ -144,7 +144,7 @@ fn http_from_lines(
 
 fn ingest_doc(machine_id: &str, crash_text: &str) -> String {
     format!(
-        r#"{{"machine_id":"{machine_id}","public_ip":"1.2.3.4","private_ip":"10.0.0.2","network_interface":"eth0","router_ip":"10.0.0.1","local_gateway":"10.0.0.1","dns_servers":["8.8.8.8"],"region":"eu","hostname":"host-1","os_version":"debian-12","server_version":"1.0.0","version":"1.2.3","lang":"en","country_code":"US","timezone":"UTC","last_boot":1700000000,"total_disk_gb":500,"used_disk_gb":120,"total_ram_gb":32,"used_ram_gb":12,"cpu_model":"Xeon","cpu_cores":8,"ram_mb":32768,"uptime_sec":123456,"crash_text":{crash_text}}}"#
+        r#"{{"machine_id":"{machine_id}","os":"debian-12","cpu":"Xeon E5","cpu_cores":8,"gpu":"NVIDIA","ram_mb":32768,"display":"1920x1080","game_version":"1.0.0","uptime_sec":123456,"crash_text":{crash_text}}}"#
     )
 }
 
@@ -246,7 +246,7 @@ fn admin_e2e_over_tcp() {
     assert_eq!(r.status, 200);
     assert_eq!(r.body, "ok\n");
 
-    // ingest: valid
+    // ingest: valid -> {"ok":true}\n (Node sends no id)
     let r = http(
         &addr,
         "POST",
@@ -256,9 +256,9 @@ fn admin_e2e_over_tcp() {
     );
     eprintln!("[e2e] ingest -> {}", r.status);
     assert_eq!(r.status, 200, "ingest: {}", r.body);
-    assert!(r.body.contains(r#""ok":true"#));
+    assert_eq!(r.body, "{\"ok\":true}\n", "ingest body: {}", r.body);
 
-    // ingest: missing field
+    // ingest: missing field (first missing is "os") -> JSON error
     let r = http(
         &addr,
         "POST",
@@ -267,7 +267,40 @@ fn admin_e2e_over_tcp() {
         r#"{"machine_id":"x"}"#.as_bytes(),
     );
     assert_eq!(r.status, 400);
-    assert!(r.body.contains("missing field"), "got: {}", r.body);
+    assert_eq!(r.body, "{\"ok\":false,\"error\":\"missing field os\"}\n", "got: {}", r.body);
+
+    // ingest: bad json
+    let r = http(
+        &addr,
+        "POST",
+        "/ms-diag/ingest",
+        &[("Content-Type", "application/json")],
+        r#"{"machine_id":"x","os":"y","cpu":"z","cpu_cores":1,"gpu":"g","ram_mb":1,"display":"d","game_version":"v","uptime_sec":1,"crash_text":null,"#.as_bytes(),
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body, "{\"ok\":false,\"error\":\"bad json\"}\n", "got: {}", r.body);
+
+    // ingest: expected object (array body)
+    let r = http(
+        &addr,
+        "POST",
+        "/ms-diag/ingest",
+        &[("Content-Type", "application/json")],
+        b"[1,2,3]",
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body, "{\"ok\":false,\"error\":\"expected object\"}\n", "got: {}", r.body);
+
+    // ingest: empty body
+    let r = http(
+        &addr,
+        "POST",
+        "/ms-diag/ingest",
+        &[("Content-Type", "application/json")],
+        b"",
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body, "{\"ok\":false,\"error\":\"empty body\"}\n", "got: {}", r.body);
 
     // ingest: invalid integer field
     let r = http(
@@ -278,7 +311,7 @@ fn admin_e2e_over_tcp() {
         ingest_doc("MACHINE-0001", "null").replace("\"cpu_cores\":8", "\"cpu_cores\":\"eight\"").as_bytes(),
     );
     assert_eq!(r.status, 400);
-    assert!(r.body.contains("invalid field"), "got: {}", r.body);
+    assert_eq!(r.body, "{\"ok\":false,\"error\":\"bad field cpu_cores\"}\n", "got: {}", r.body);
 
     // ingest: payload too large (rejected on content-length header alone,
     // like the Node admin — no body is sent so the close stays clean)
@@ -291,12 +324,12 @@ fn admin_e2e_over_tcp() {
         b"",
     );
     assert_eq!(r.status, 413);
-    assert!(r.body.contains("payload too large"), "got: {}", r.body);
+    assert_eq!(r.body, "{\"ok\":false,\"error\":\"payload too large\"}\n", "got: {}", r.body);
 
     // viewer requires login
     let r = get(&addr, "/ms-admin/", None);
     assert_eq!(r.status, 401);
-    assert!(r.body.contains("Sign in"));
+    assert!(r.body.contains("Please sign in."), "got: {}", r.body);
 
     // bad login
     let r = post(
@@ -306,7 +339,7 @@ fn admin_e2e_over_tcp() {
         "username=admin&password=wrong-password&totp=000000",
     );
     assert_eq!(r.status, 401);
-    assert!(r.body.contains("invalid credentials"));
+    assert!(r.body.contains("Invalid credentials."), "got: {}", r.body);
 
     // good login
     let (token, _) = login(&addr);
@@ -315,11 +348,12 @@ fn admin_e2e_over_tcp() {
     let r = get(&addr, "/ms-admin/", Some(&token));
     assert_eq!(r.status, 200);
     assert!(r.body.contains("MACHINE-0001"), "viewer body: {}", r.body);
-    assert!(r.body.contains("Signed in from"));
+    assert!(r.body.contains("signed in from"), "viewer body: {}", r.body);
 
     // unknown admin path with valid session -> 404
     let r = get(&addr, "/ms-admin/nope", Some(&token));
     assert_eq!(r.status, 404);
+    assert_eq!(r.body, "not found\n");
 
     // logout
     let r = post(&addr, "/ms-admin/logout", Some(&token), "");
@@ -334,7 +368,7 @@ fn admin_e2e_over_tcp() {
     let r = get(&addr, "/ms-admin/", Some(&token2));
     assert_eq!(r.status, 401);
 
-    // lockout: five failures then the sixth is rejected as locked out
+    // lockout: five failures, then the sixth is 423 with a retry message
     for _ in 0..5 {
         let r = post(
             &addr,
@@ -350,8 +384,17 @@ fn admin_e2e_over_tcp() {
         None,
         "username=admin&password=wrong-password&totp=000000",
     );
-    assert_eq!(r.status, 401);
-    assert!(r.body.contains("too many failed attempts"), "got: {}", r.body);
+    assert_eq!(r.status, 423, "got: {}", r.body);
+    assert!(r.body.contains("Too many failed attempts"), "got: {}", r.body);
+
+    // unsupported methods -> 501 "Unsupported method\n" (Node behavior,
+    // including HEAD)
+    let r = http(&addr, "PUT", "/ms-admin/healthz", &[], b"");
+    assert_eq!(r.status, 501);
+    assert_eq!(r.body, "Unsupported method\n");
+    let r = http(&addr, "HEAD", "/ms-admin/healthz", &[], b"");
+    assert_eq!(r.status, 501);
+    assert_eq!(r.body, "Unsupported method\n");
 
     // healthz still reachable after lockout
     let r = get(&addr, "/ms-admin/healthz", None);
