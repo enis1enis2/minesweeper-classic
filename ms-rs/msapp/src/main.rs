@@ -19,6 +19,7 @@ struct Cli {
     telemetry_host: String,
     telemetry_port: u16, // 0 = off
     tls: bool,
+    http: bool,
     tls_ca: Option<String>,
     solver_user: Option<String>,
     solver_pass: Option<String>,
@@ -34,6 +35,7 @@ impl Default for Cli {
             telemetry_host: host,
             telemetry_port: port,
             tls: false,
+            http: false,
             tls_ca: None,
             solver_user: None,
             solver_pass: None,
@@ -90,6 +92,8 @@ fn parse_cli() -> Cli {
             parse_telemetry_arg(s, &mut cli);
         } else if a == "--tls" {
             cli.tls = true;
+        } else if a == "--http" {
+            cli.http = true;
         } else if a == "--tls-ca" {
             let mut v = None;
             take_next(&mut i, &mut v);
@@ -189,6 +193,7 @@ fn main() -> eframe::Result {
         c.port = cli.telemetry_port;
         c.telemetry_on = cli.telemetry_port != 0;
         c.tls = cli.tls && cli.telemetry_port != 0;
+        c.http = cli.http && cli.telemetry_port != 0;
         c.tls_ca = cli.tls_ca.clone();
         c.solver_user = user.clone().unwrap_or_default();
         c.solver_pass = pass.clone().unwrap_or_default();

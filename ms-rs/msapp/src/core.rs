@@ -74,6 +74,9 @@ pub struct Core {
     pub telemetry_on: bool,
     /// Use TLS for the telemetry link (`--tls`).
     pub tls: bool,
+    /// Use the HTTP(S) `/ms-sim/*` transport instead of the raw streaming
+    /// protocol (`--http`). With `--tls` this is HTTPS (native rustls).
+    pub http: bool,
     /// Optional PEM CA bundle to trust in addition to the system roots
     /// (`--tls-ca FILE`), e.g. a self-signed or private CA.
     pub tls_ca: Option<String>,
@@ -106,6 +109,7 @@ impl Core {
             solver_pass: String::new(),
             telemetry_on: true,
             tls: false,
+            http: false,
             tls_ca: None,
             connected: false,
             attempts: 0,

@@ -470,9 +470,350 @@ async fn run_task(core: Arc<Mutex<Core>>, mut rx: mpsc::UnboundedReceiver<OutMsg
 
 /// Spawn the telemetry task on the current tokio runtime.
 pub fn spawn(core: Arc<Mutex<Core>>, rx: mpsc::UnboundedReceiver<OutMsg>) {
+    let http = core.lock().unwrap().http;
     tokio::spawn(async move {
-        run_task(core, rx).await;
+        if http {
+            run_http_task(core, rx).await;
+        } else {
+            run_task(core, rx).await;
+        }
     });
+}
+
+// ---------------------------------------------------------------------------
+// HTTP(S) transport (`--http`): request/response against the /ms-sim/*
+// endpoints instead of the streaming protocol. The server closes each
+// connection after replying, so every exchange opens a fresh (optionally
+// rustls-wrapped) connection; the seed cursor keeps polls lossless.
+// ---------------------------------------------------------------------------
+
+const HTTP_POLL_MS: u64 = 1_000; // seed poll interval
+const HTTP_FLUSH_MS: u64 = 1_000; // metric flush interval
+const METRIC_BUF_MAX: usize = 512;
+
+struct HttpResp {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_lines: Vec<String>,
+}
+
+async fn http_connect(
+    core: &Arc<Mutex<Core>>,
+    tls_connector: Option<&tokio_rustls::TlsConnector>,
+) -> Result<DynStream, String> {
+    let (host, port) = {
+        let c = core.lock().unwrap();
+        (c.host.clone(), c.port)
+    };
+    let addr = format!("{}:{}", host, port);
+    let s = timeout(
+        Duration::from_secs(CONNECT_TO),
+        TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| format!("connect timeout {}", addr))?
+    .map_err(|e| format!("connect {}: {}", addr, e))?;
+    let _ = s.set_nodelay(true);
+    match tls_connector {
+        Some(conn) => {
+            let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                .map_err(|e| format!("invalid TLS server name {:?}: {}", host, e))?;
+            let tls = timeout(
+                Duration::from_secs(CONNECT_TO),
+                conn.connect(server_name, s),
+            )
+            .await
+            .map_err(|_| "TLS handshake timeout".to_string())?
+            .map_err(|e| format!("TLS handshake: {}", e))?;
+            Ok(Box::new(tls))
+        }
+        None => Ok(Box::new(s)),
+    }
+}
+
+async fn http_exchange(
+    stream: &mut DynStream,
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> Result<HttpResp, String> {
+    let mut hdrs = format!(
+        "Host: {}\r\nContent-Type: text/plain; charset=utf-8\r\n",
+        host
+    );
+    if !headers.is_empty() {
+        hdrs.push_str(headers);
+        hdrs.push_str("\r\n");
+    }
+    if !body.is_empty() {
+        hdrs.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    let req = format!("{} {} HTTP/1.1\r\n{}\r\n{}", method, path, hdrs, body);
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("write: {}", e))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(format!("read: {}", e)),
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let mut parts = text.splitn(2, "\r\n\r\n");
+    let head = parts.next().unwrap_or("");
+    let body = parts.next().unwrap_or("");
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| {
+            let i = l.find(':')?;
+            Some((l[..i].trim().to_ascii_lowercase(), l[i + 1..].trim().to_string()))
+        })
+        .collect();
+    let body_lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
+    Ok(HttpResp { status, headers, body_lines })
+}
+
+/// One request/response round trip on a fresh connection. Returns the parsed
+/// 2xx response, or None on any transport/status failure.
+async fn do_exchange(
+    core: &Arc<Mutex<Core>>,
+    tls_connector: Option<&tokio_rustls::TlsConnector>,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> Option<HttpResp> {
+    let (host, _) = {
+        let c = core.lock().unwrap();
+        (c.host.clone(), c.port)
+    };
+    let mut stream = http_connect(core, tls_connector).await.ok()?;
+    match http_exchange(&mut stream, &host, method, path, headers, body).await {
+        Ok(resp) if (200..300).contains(&resp.status) => Some(resp),
+        _ => None,
+    }
+}
+
+/// Full HMAC challenge + request: POST /ms-sim/auth for a fresh nonce, then
+/// POST /ms-sim/req with X-Ms-User / X-Ms-Auth. Returns the reply lines.
+async fn do_req(
+    core: &Arc<Mutex<Core>>,
+    tls_connector: Option<&tokio_rustls::TlsConnector>,
+    line: &str,
+) -> Option<Vec<String>> {
+    let (user, pass) = {
+        let c = core.lock().unwrap();
+        (c.solver_user.clone(), c.solver_pass.clone())
+    };
+    let chal = do_exchange(core, tls_connector, "POST", "/ms-sim/auth", "", &format!("auth {}", user))
+        .await?;
+    let nonce = chal
+        .body_lines
+        .iter()
+        .find_map(|l| l.strip_prefix("authchal "))?
+        .to_string();
+    let digest = hmac_sha256_hex(&pass, &format!("{}{}", AUTH_PREFIX, nonce));
+    let headers = format!("X-Ms-User: {}\r\nX-Ms-Auth: {}", user, digest);
+    let resp = do_exchange(core, tls_connector, "POST", "/ms-sim/req", &headers, line).await?;
+    Some(resp.body_lines)
+}
+
+fn lbtop_path(line: &str) -> String {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    match toks.len() {
+        2 => format!("/ms-sim/lbtop?count={}", toks[1]),
+        3 => format!("/ms-sim/lbtop?diff={}&count={}", toks[1], toks[2]),
+        _ => "/ms-sim/lbtop".to_string(),
+    }
+}
+
+async fn run_http_task(core: Arc<Mutex<Core>>, mut rx: mpsc::UnboundedReceiver<OutMsg>) {
+    let mut l = LinkInner {
+        core: core.clone(),
+        stream: None,
+        inbound: Vec::new(),
+        out_lines: VecDeque::new(),
+        session: false,
+    };
+    let tls_connector: Option<tokio_rustls::TlsConnector> = {
+        let c = l.core.lock().unwrap();
+        if c.tls {
+            match build_client_config(c.tls_ca.as_deref()) {
+                Ok(cfg) => Some(tokio_rustls::TlsConnector::from(Arc::new(cfg))),
+                Err(e) => {
+                    eprintln!("msapp: TLS config error: {}; telemetry disabled", e);
+                    l.core.lock().unwrap().telemetry_on = false;
+                    l.core.lock().unwrap().connected = false;
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+    let tls_ref = tls_connector.as_ref();
+    let mut next_beat = std::time::Instant::now() + Duration::from_millis(BEAT_MS);
+    let mut next_flush = std::time::Instant::now();
+    let mut next_seed_poll = std::time::Instant::now();
+    let mut cursor: u64 = 0;
+    let mut metric_buf: Vec<String> = Vec::new();
+
+    loop {
+        if !l.core.lock().unwrap().telemetry_on {
+            sleep(Duration::from_millis(LOOP_TV_MS)).await;
+            continue;
+        }
+        while let Ok(msg) = rx.try_recv() {
+            handle_outbound(&mut l, msg);
+        }
+        drain_engine_metrics(&mut l);
+        maybe_emit_latency(&mut l, std::time::Instant::now(), &mut next_beat);
+
+        // Partition queued lines by endpoint kind.
+        let mut req_line: Option<String> = None;
+        let mut lbscore_line: Option<String> = None;
+        let mut lbtop_line: Option<String> = None;
+        let mut keep: VecDeque<String> = VecDeque::new();
+        for line in l.out_lines.drain(..) {
+            let kind = line
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if kind == "metric" {
+                if metric_buf.len() < METRIC_BUF_MAX {
+                    metric_buf.push(line);
+                } else {
+                    l.core.lock().unwrap().metrics_dropped += 1;
+                }
+            } else if req_line.is_none() && kind.starts_with("req") {
+                req_line = Some(line);
+            } else if lbscore_line.is_none() && kind == "lbscore" {
+                lbscore_line = Some(line);
+            } else if lbtop_line.is_none() && kind == "lbtop" {
+                lbtop_line = Some(line);
+            } else {
+                keep.push_back(line);
+            }
+        }
+        l.out_lines = keep;
+
+        let now = std::time::Instant::now();
+
+        // Auth probe: after a successful challenge the server keys us by IP
+        // (auth_resolve sets authed=true), so AUTH_OK mirrors the TCP authok.
+        {
+            let (wanted, state, denied) = {
+                let c = l.core.lock().unwrap();
+                (c.solver_wanted(), c.auth_state, c.solver_denied)
+            };
+            if wanted && state != AUTH_OK && !denied {
+                let user = l.core.lock().unwrap().solver_user.clone();
+                if let Some(chal) =
+                    do_exchange(&l.core, tls_ref, "POST", "/ms-sim/auth", "", &format!("auth {}", user))
+                        .await
+                {
+                    if chal.body_lines.iter().any(|x| x.starts_with("authchal ")) {
+                        l.core.lock().unwrap().auth_state = AUTH_OK;
+                        l.core.lock().unwrap().connected = true;
+                    }
+                }
+            }
+        }
+
+        // Metrics flush.
+        if now >= next_flush && !metric_buf.is_empty() {
+            let body = metric_buf.join("\n");
+            let n = metric_buf.len();
+            if do_exchange(&l.core, tls_ref, "POST", "/ms-sim/metrics", "", &body).await.is_some() {
+                l.core.lock().unwrap().metrics_sent += n as u64;
+                metric_buf.clear();
+                l.core.lock().unwrap().connected = true;
+            }
+            next_flush = std::time::Instant::now() + Duration::from_millis(HTTP_FLUSH_MS);
+        }
+
+        // Request: fresh challenge + req per request (nonces are single-use).
+        if let Some(line) = req_line {
+            match do_req(&l.core, tls_ref, &line).await {
+                Some(replies) => {
+                    let denied = replies.iter().any(|r| r == "autherr");
+                    for r in replies {
+                        handle_inbound(&mut l, &r);
+                    }
+                    if denied {
+                        l.core.lock().unwrap().solver_denied = true;
+                        l.core.lock().unwrap().auth_state = AUTH_NONE;
+                        l.core.lock().unwrap().connected = false;
+                    } else {
+                        l.core.lock().unwrap().connected = true;
+                    }
+                }
+                None => {
+                    l.core.lock().unwrap().sim_session = false;
+                    l.session = false;
+                }
+            }
+        }
+
+        // Leaderboard submit.
+        if let Some(line) = lbscore_line {
+            if do_exchange(&l.core, tls_ref, "POST", "/ms-sim/lbscore", "", &line).await.is_some() {
+                l.core.lock().unwrap().connected = true;
+            }
+        }
+
+        // Leaderboard fetch.
+        if let Some(line) = lbtop_line {
+            if let Some(resp) = do_exchange(&l.core, tls_ref, "GET", &lbtop_path(&line), "", "").await {
+                for r in resp.body_lines {
+                    handle_inbound(&mut l, &r);
+                }
+                l.core.lock().unwrap().connected = true;
+            }
+        }
+
+        // Seed poll (liveness): the cursor makes it lossless.
+        if now >= next_seed_poll {
+            next_seed_poll = std::time::Instant::now() + Duration::from_millis(HTTP_POLL_MS);
+            if let Some(resp) =
+                do_exchange(&l.core, tls_ref, "GET", &format!("/ms-sim/seeds?since={}", cursor), "", "")
+                    .await
+            {
+                if let Some(c) = resp.headers.iter().find(|(k, _)| k == "x-ms-cursor") {
+                    if let Ok(c) = c.1.parse::<u64>() {
+                        cursor = c;
+                    }
+                }
+                for r in resp.body_lines {
+                    handle_inbound(&mut l, &r);
+                }
+                l.core.lock().unwrap().connected = true;
+            } else {
+                l.core.lock().unwrap().connected = false;
+                l.core.lock().unwrap().sim_session = false;
+                l.core.lock().unwrap().auth_state = AUTH_NONE;
+                l.session = false;
+            }
+            l.core.lock().unwrap().attempts += 1;
+        }
+
+        sleep(Duration::from_millis(LOOP_TV_MS)).await;
+    }
 }
 
 #[cfg(test)]
@@ -501,5 +842,86 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn lbtop_path_builds_query() {
+        assert_eq!(lbtop_path("lbtop 5"), "/ms-sim/lbtop?count=5");
+        assert_eq!(
+            lbtop_path("lbtop expert 3"),
+            "/ms-sim/lbtop?diff=expert&count=3"
+        );
+        assert_eq!(lbtop_path("lbtop"), "/ms-sim/lbtop");
+    }
+
+    #[tokio::test]
+    async fn http_exchange_builds_request_and_parses_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (server_half, client_half) = tokio::io::duplex(4096);
+        let mut client: DynStream = Box::new(client_half);
+        let mut server = server_half;
+
+        let client_task = tokio::spawn(async move {
+            http_exchange(&mut client, "example.test", "POST", "/ms-sim/req",
+                "X-Ms-User: alice\r\nX-Ms-Auth: deadbeef", "reqseed beginner 12345")
+                .await
+                .expect("http_exchange")
+        });
+
+        let expected =
+            "POST /ms-sim/req HTTP/1.1\r\nHost: example.test\r\nContent-Type: text/plain; charset=utf-8\r\nX-Ms-User: alice\r\nX-Ms-Auth: deadbeef\r\nContent-Length: 22\r\n\r\nreqseed beginner 12345";
+        let mut req = vec![0u8; expected.len()];
+        server.read_exact(&mut req).await.unwrap();
+        let req = String::from_utf8_lossy(&req).into_owned();
+        assert_eq!(req, expected);
+
+        server
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Ms-Cursor: 7\r\n\r\nseed beginner 5\n",
+            )
+            .await
+            .unwrap();
+        drop(server);
+
+        let resp = client_task.await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers
+                .iter()
+                .find(|(k, _)| k == "x-ms-cursor")
+                .map(|(_, v)| v.as_str()),
+            Some("7")
+        );
+        assert_eq!(resp.body_lines, vec!["seed beginner 5"]);
+    }
+
+    #[tokio::test]
+    async fn http_exchange_sends_get_without_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (server_half, client_half) = tokio::io::duplex(4096);
+        let mut client: DynStream = Box::new(client_half);
+        let mut server = server_half;
+
+        let client_task = tokio::spawn(async move {
+            http_exchange(&mut client, "example.test", "GET", "/ms-sim/seeds?since=3", "", "")
+                .await
+                .expect("http_exchange")
+        });
+
+        let expected = "GET /ms-sim/seeds?since=3 HTTP/1.1\r\nHost: example.test\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n";
+        let mut req = vec![0u8; expected.len()];
+        server.read_exact(&mut req).await.unwrap();
+        let req = String::from_utf8_lossy(&req).into_owned();
+        assert_eq!(req, expected);
+        assert!(!req.contains("Content-Length"));
+
+        server.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        drop(server);
+
+        let resp = client_task.await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(resp.body_lines.is_empty());
     }
 }
