@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const FIXTURE_DIR: &str = "ms/test/fixtures";
+const FIXTURE_DIR: &str = "archive/ms/test/fixtures";
 const DEFAULT_C_EXE: &str = "build/minesweeper-x64.exe";
 const DEFAULT_RUST_EXE: &str = "ms-rs/target/debug/msapp.exe";
 
