@@ -23,6 +23,8 @@ int x11_main(void);
 
 static char     g_telemetry_host[128];
 static unsigned g_telemetry_port;
+static int      g_telemetry_http;          /* 0=raw TCP, 1=HTTP, 2=HTTPS */
+static int      g_telemetry_https_insecure;
 
 enum Frontend { FE_AUTO, FE_X11, FE_TERM, FE_HEADLESS };
 static enum Frontend g_fe = FE_AUTO;
@@ -44,6 +46,9 @@ static void usage(const char *prog) {
         "\n"
         "Telemetry (on by default):\n"
         "  --telemetry <host:port>   simulation/telemetry endpoint\n"
+        "  --telemetry-http          use the /ms-sim/ HTTP transport (libcurl)\n"
+        "  --telemetry-https         use the /ms-sim/ HTTPS transport (libcurl)\n"
+        "  --telemetry-https-insecure  --telemetry-https without cert checks (debug)\n"
         "  --no-telemetry            disable the connection\n"
         "\n"
         "Solver credentials (used for the HMAC-SHA256 challenge):\n"
@@ -93,6 +98,10 @@ static void parse_frontend_and_telemetry(int argc, char **argv) {
             parse_telemetry_arg(argv[++i]);
         else if (strncmp(a, "--telemetry=", 12) == 0)
             parse_telemetry_arg(a + 12);
+        else if (strcmp(a, "--telemetry-http") == 0) g_telemetry_http = 1;
+        else if (strcmp(a, "--telemetry-https") == 0) g_telemetry_http = 2;
+        else if (strcmp(a, "--telemetry-https-insecure") == 0)
+            g_telemetry_https_insecure = 1;
     }
 }
 
@@ -139,7 +148,11 @@ int main(int argc, char **argv) {
             g_fe = FE_HEADLESS;
     }
 
-    /* telemetry is forced on by default (matches the Win32 client) */
+    /* telemetry is forced on by default (matches the Win32 client).
+     * --telemetry-http / --telemetry-https switch the transport from the
+     * raw TCP stream to the /ms-sim/ HTTP(S) endpoints (libcurl). */
+    net_set_http_mode(g_telemetry_http);
+    net_set_https_insecure(g_telemetry_https_insecure);
     if (g_telemetry_port != 0)
         net_telemetry_start(g_telemetry_host, (unsigned short)g_telemetry_port);
 

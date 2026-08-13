@@ -33,14 +33,26 @@
 #include <string.h>
 #include <stdarg.h>
 
+#ifdef MS_HTTP
+#include <curl/curl.h>
+#endif
+
 #define Q_CAP         256          /* max pending metric lines        */
+#ifndef LINE_MAX                    /* limits.h may already define it  */
 #define LINE_MAX      512          /* max serialised metric line      */
+#endif
 #define SEND_MAX      16384        /* outbound byte buffer            */
 #define CONNECT_TO    5000         /* ms to complete the TCP handshake*/
 #define LOOP_TV_MS    100          /* select() poll interval (ms)     */
 #define BEAT_MS       10000        /* heartbeat interval (ms)         */
 #define RETRY_MS      3000         /* backoff between connect retries */
 #define AUTH_PREFIX   "ms-auth:"   /* HMAC challenge-response domain   */
+
+#ifdef MS_HTTP
+#define HTTP_LOOP_MS  1000         /* HTTP(S) session poll interval    */
+#define HTTP_POST_HEADERS \
+    "Content-Type: application/octet-stream\r\n"
+#endif
 
 /* solver auth state */
 #define AUTH_NONE      0           /* not authenticated / no creds     */
@@ -101,6 +113,17 @@ static volatile unsigned long long g_stats_sent = 0;
 static volatile unsigned long long g_stats_dropped = 0;
 static volatile unsigned long long g_stats_attempts = 0;
 static volatile unsigned long long g_connected_at_ms = 0;
+
+#ifdef MS_HTTP
+/* HTTP(S) transport (libcurl) state.  g_http_mode / g_https_insecure are
+ * set by the main thread before the network thread starts; the rest are
+ * touched only on the network thread. */
+static int   g_http_mode = 0;        /* 0=raw TCP, 1=plain HTTP, 2=HTTPS */
+static int   g_https_insecure = 0;   /* 1 = disable libcurl cert checks  */
+static char  g_auth_nonce[129];      /* latest authchal nonce (hex)       */
+static unsigned long long g_seed_cursor = 0;   /* x-ms-cursor watermark   */
+static int   g_session_gen = 0;      /* bumps per net_telemetry_start     */
+#endif
 
 static void stats_inc(volatile unsigned long long *v) {
     __atomic_add_fetch(v, 1, __ATOMIC_RELAXED);
@@ -442,6 +465,411 @@ static void heartbeat(int s) {
     (void)s;
 }
 
+#ifdef MS_HTTP
+/* ------------------------------------------------------------------ */
+/* HTTP(S) transport (libcurl)                                         */
+/* ------------------------------------------------------------------ */
+
+/* Growable response buffer (heap): http_exchange reallocs as the body is
+ * read, so no response is truncated. */
+typedef struct {
+    char  *data;
+    size_t len;
+    size_t cap;
+} HttpBuf;
+
+static void http_buf_free(HttpBuf *b) {
+    free(b->data);
+    b->data = NULL;
+    b->len = b->cap = 0;
+}
+
+static size_t http_write_cb(char *ptr, size_t size, size_t nmemb, void *ud) {
+    HttpBuf *b = (HttpBuf *)ud;
+    size_t n = size * nmemb;
+    if (b->len + n + 1 > b->cap) {
+        size_t ncap = b->cap ? b->cap * 2 : 8192;
+        while (ncap < b->len + n + 1) ncap *= 2;
+        if (ncap > (1u << 24)) return 0;   /* 16 MB hard cap: abort read */
+        char *np = (char *)realloc(b->data, ncap);
+        if (!np) return 0;
+        b->data = np;
+        b->cap = ncap;
+    }
+    memcpy(b->data + b->len, ptr, n);
+    b->len += n;
+    b->data[b->len] = 0;
+    return n;
+}
+
+static size_t http_header_cb(char *ptr, size_t size, size_t nmemb, void *ud) {
+    unsigned long long *cursor = (unsigned long long *)ud;
+    size_t n = size * nmemb;
+    /* "X-Ms-Cursor: <n>" or "<n>\r\n" on the continuation line */
+    if (n >= 13 && strncasecmp(ptr, "X-Ms-Cursor:", 12) == 0) {
+        char tmp[24];
+        size_t i, j = 0;
+        for (i = 12; i < n && j < sizeof(tmp) - 1; i++) {
+            if (ptr[i] == '\r' || ptr[i] == '\n') break;
+            tmp[j++] = ptr[i];
+        }
+        tmp[j] = 0;
+        *cursor = strtoull(tmp, NULL, 10);
+    }
+    return n;
+}
+
+/* Convert the caller's CRLF-terminated header block into a libcurl slist. */
+static struct curl_slist *http_make_slist(const char *headers) {
+    struct curl_slist *h = NULL;
+    char tmp[512];
+    char *tok, *save = NULL;
+    if (!headers) return NULL;
+    snprintf(tmp, sizeof(tmp), "%s", headers);
+    tok = strtok_r(tmp, "\r\n", &save);
+    while (tok) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (*tok) h = curl_slist_append(h, tok);
+        tok = strtok_r(NULL, "\r\n", &save);
+    }
+    return h;
+}
+
+/* One synchronous libcurl request/response on the network thread.  Returns
+ *   1  a 2xx response; its body is copied into *out (NUL-terminated).
+ *      *cursor is set from the X-Ms-Cursor header when non-NULL and present.
+ *   0  the server answered with a non-2xx status (endpoint reachable).
+ *  -1  transport failure (DNS / connect / TLS / send / receive): the caller
+ *      tears the session down and retries.
+ * Each exchange uses a fresh easy handle (curl_easy_init is cheap and the
+ * connection is closed after every request, matching the server's
+ * per-request Connection: close contract).  TLS is OpenSSL via libcurl;
+ * HTTP/2 is negotiated only if the server offers it, which mserver does
+ * not. */
+static int http_exchange(const char *method, const char *path,
+                         const char *headers, const char *body,
+                         unsigned long long *cursor, HttpBuf *out) {
+    CURL *c;
+    struct curl_slist *hdr = NULL;
+    char url[512];
+    long status = 0;
+    int ret = -1;
+
+    if (!method || !path || !out) return -1;
+    snprintf(url, sizeof(url), "%s://%s:%u%s",
+             (g_http_mode == 2) ? "https" : "http",
+             g_host, (unsigned)g_port, path);
+
+    c = curl_easy_init();
+    if (!c) return -1;
+    /* one response per request: the caller reuses the same HttpBuf for the
+     * auth probe, metrics, req and seeds exchanges within a loop pass, so
+     * never accumulate a previous body into the next one */
+    out->len = 0;
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, http_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, out);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, 30000L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    if (body) {
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+    }
+    if (g_http_mode == 2 && g_https_insecure) {
+        curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+    hdr = http_make_slist(headers);
+    if (hdr) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
+    if (cursor) {
+        *cursor = 0;
+        curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, http_header_cb);
+        curl_easy_setopt(c, CURLOPT_HEADERDATA, cursor);
+    }
+
+    if (curl_easy_perform(c) == CURLE_OK) {
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+        if (status >= 200 && status < 300)
+            ret = 1;
+        else
+            ret = 0;
+    }
+    curl_slist_free_all(hdr);
+    curl_easy_cleanup(c);
+    return ret;
+}
+
+/* Append one protocol line + '\n' to an outbound HTTP body.  Counts the
+ * line; on overflow it is dropped (same accounting as the raw-TCP queue). */
+static void http_body_append(char *buf, size_t cap, int *n, const char *line) {
+    size_t len = strlen(line);
+    size_t cur = strlen(buf);
+    if (cur + len + 2 > cap) {
+        stats_inc(&g_stats_dropped);
+        return;
+    }
+    memcpy(buf + cur, line, len);
+    cur += len;
+    buf[cur++] = '\n';
+    buf[cur] = 0;
+    (*n)++;
+}
+
+/* Build the /ms-sim/lbtop query from a `lbtop [<diff>] <count>` line. */
+static void http_lbtop_query(const char *line, char *out, size_t cap) {
+    char tmp[64];
+    char *save = NULL, *tok;
+    char *diff = NULL, *count = NULL;
+    strncpy(tmp, line, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+    tok = strtok_r(tmp, " \t", &save);      /* "lbtop" */
+    if (tok) {
+        tok = strtok_r(NULL, " \t", &save);
+        if (tok) {
+            if (parse_diff_name_t(tok) >= 0) {
+                diff = tok;
+                tok = strtok_r(NULL, " \t", &save);
+                if (tok) count = tok;
+            } else {
+                count = tok;
+            }
+        }
+    }
+    if (count)
+        snprintf(out, cap, "?count=%s", count);
+    else
+        snprintf(out, cap, "?count=10");
+    if (diff)
+        snprintf(out, cap, "?diff=%s&count=%s", diff, count ? count : "10");
+}
+
+/* Hand a complete HTTP response body to the shared line parser. */
+static void dispatch_response(char *body) {
+    int used = (int)strlen(body);
+    if (used > 0) dispatch_lines(body, &used);
+}
+
+/* Capture an `authchal <nonce>` response body into g_auth_nonce. */
+static int http_parse_authchal(const char *body) {
+    const char *p;
+    size_t len;
+    if (strncasecmp(body, "authchal ", 9) != 0) return 0;
+    p = body + 9;
+    while (*p == ' ' || *p == '\t') p++;
+    len = strlen(p);
+    while (len && (p[len - 1] == '\n' || p[len - 1] == '\r' ||
+                   p[len - 1] == ' ' || p[len - 1] == '\t')) len--;
+    if (len == 0 || len >= sizeof(g_auth_nonce)) return 0;
+    memcpy(g_auth_nonce, p, len);
+    g_auth_nonce[len] = 0;
+    return 1;
+}
+
+/* Push a solver-denied notice onto the core event queue. */
+static void http_solver_denied(void) {
+    MsEvent e;
+    memset(&e, 0, sizeof(e));
+    e.kind = EV_SOLVER_DENIED;
+    ms_event_push(&e);
+}
+
+/* Run the HTTP(S) session: poll once per HTTP_LOOP_MS.  Returns when the
+ * session must be torn down (transport failure, shutdown, or a newer
+ * session superseded it via net_telemetry_start). */
+static void http_run(int gen) {
+    unsigned long long last_beat = 0;
+    int wanted = solver_wanted();
+
+    g_connected = 1;
+    g_connected_at_ms = ms_now_ms();
+    __atomic_store_n(&g_sim_session, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_auth_state, AUTH_NONE, __ATOMIC_RELEASE);
+
+    while (g_running) {
+        char batch[SEND_MAX];
+        char headers[512];
+        HttpBuf resp = {0};
+        int n, transport_ok = 1;
+        int metric_n = 0, req_n = 0, lb_n = 0;
+        char metric_body[SEND_MAX + 64], req_body[SEND_MAX + 64];
+        char lb_body[SEND_MAX + 64], lbtop_query[96];
+
+        /* a telemetry off/on toggle may have superseded this session while
+         * a libcurl call was blocking: bail so we never run two senders */
+        if (__atomic_load_n(&g_session_gen, __ATOMIC_ACQUIRE) != gen) break;
+
+        usleep(HTTP_LOOP_MS * 1000);
+
+        /* connectivity probe: with credentials this also refreshes the
+         * challenge nonce (the server's nonce is single-use) */
+        if (wanted) {
+            char user[64];
+            solver_creds(user, sizeof(user), NULL, 0);
+            snprintf(batch, sizeof(batch), "auth %s", user);
+            int r = http_exchange("POST", "/ms-sim/auth", HTTP_POST_HEADERS,
+                                  batch, NULL, &resp);
+            if (r == -1) {
+                transport_ok = 0;
+            } else if (r == 1) {
+                if (http_parse_authchal(resp.data)) {
+                    __atomic_store_n(&g_auth_state, AUTH_OK, __ATOMIC_RELEASE);
+                } else if (strncasecmp(resp.data, "autherr", 7) == 0) {
+                    __atomic_store_n(&g_auth_state, AUTH_NONE,
+                                     __ATOMIC_RELEASE);
+                }
+            }
+            if (!transport_ok) break;
+        }
+
+        /* drain the outbound queue once; lines leave the queue now and, if
+         * a request below fails, are counted dropped (mirrors the raw-TCP
+         * session where unflushed bytes die with the connection) */
+        n = queue_drain(batch, sizeof(batch));
+        metric_body[0] = req_body[0] = lb_body[0] = lbtop_query[0] = 0;
+        if (n > 0) {
+            batch[n] = 0;
+            char *save = NULL;
+            char *line = strtok_r(batch, "\n", &save);
+            while (line) {
+                if (strncasecmp(line, "metric ", 7) == 0) {
+                    http_body_append(metric_body, sizeof(metric_body),
+                                     &metric_n, line);
+                } else if (strncasecmp(line, "req", 3) == 0) {
+                    http_body_append(req_body, sizeof(req_body), &req_n, line);
+                } else if (strncasecmp(line, "lbscore ", 8) == 0) {
+                    http_body_append(lb_body, sizeof(lb_body), &lb_n, line);
+                } else if (strncasecmp(line, "lbtop", 5) == 0) {
+                    if (lbtop_query[0] == 0)
+                        http_lbtop_query(line, lbtop_query, sizeof(lbtop_query));
+                } else {
+                    stats_inc(&g_stats_dropped);
+                }
+                line = strtok_r(NULL, "\n", &save);
+            }
+        }
+
+        if (metric_n > 0) {
+            int r = http_exchange("POST", "/ms-sim/metrics", HTTP_POST_HEADERS,
+                                  metric_body, NULL, &resp);
+            if (r == 1) {
+                stats_add(&g_stats_sent, (unsigned long long)metric_n);
+            } else {
+                stats_add(&g_stats_dropped, (unsigned long long)metric_n);
+                if (r == -1) { transport_ok = 0; break; }
+            }
+        }
+
+        if (req_n > 0) {
+            char user[64], pass[128], resp_hex[65], msg[256];
+            uint8_t mac[32];
+            int authed = 0;
+            if (wanted) {
+                solver_creds(user, sizeof(user), pass, sizeof(pass));
+                snprintf(batch, sizeof(batch), "auth %s", user);
+                int r = http_exchange("POST", "/ms-sim/auth", HTTP_POST_HEADERS,
+                                      batch, NULL, &resp);
+                if (r == -1) {
+                    stats_add(&g_stats_dropped, (unsigned long long)req_n);
+                    transport_ok = 0;
+                    break;
+                } else if (r == 1) {
+                    if (http_parse_authchal(resp.data)) {
+                        authed = 1;
+                    } else if (strncasecmp(resp.data, "autherr", 7) == 0) {
+                        __atomic_store_n(&g_auth_state, AUTH_NONE,
+                                         __ATOMIC_RELEASE);
+                        http_solver_denied();
+                    }
+                }
+            }
+            if (authed && g_auth_nonce[0]) {
+                snprintf(msg, sizeof(msg), AUTH_PREFIX "%s", g_auth_nonce);
+                ms_hmac_sha256((const uint8_t *)pass, strlen(pass),
+                               (const uint8_t *)msg, strlen(msg), mac);
+                ms_hex_encode(mac, 32, resp_hex);
+                snprintf(headers, sizeof(headers),
+                         "Content-Type: application/octet-stream\r\n"
+                         "X-Ms-User: %s\r\n"
+                         "X-Ms-Auth: %s\r\n", user, resp_hex);
+                int r = http_exchange("POST", "/ms-sim/req", headers, req_body,
+                                      NULL, &resp);
+                if (r == 1) {
+                    dispatch_response(resp.data);
+                    stats_add(&g_stats_sent, (unsigned long long)req_n);
+                } else {
+                    stats_add(&g_stats_dropped, (unsigned long long)req_n);
+                    if (r == -1) { transport_ok = 0; break; }
+                    http_solver_denied();
+                }
+            } else {
+                /* no (valid) credentials: the request is never delivered */
+                stats_add(&g_stats_dropped, (unsigned long long)req_n);
+            }
+        }
+
+        if (lb_n > 0) {
+            int r = http_exchange("POST", "/ms-sim/lbscore", HTTP_POST_HEADERS,
+                                  lb_body, NULL, &resp);
+            if (r == 1) {
+                dispatch_response(resp.data);
+                stats_add(&g_stats_sent, (unsigned long long)lb_n);
+            } else {
+                stats_add(&g_stats_dropped, (unsigned long long)lb_n);
+                if (r == -1) { transport_ok = 0; break; }
+            }
+        }
+
+        if (lbtop_query[0]) {
+            char path[320];
+            snprintf(path, sizeof(path), "/ms-sim/lbtop%s", lbtop_query);
+            int r = http_exchange("GET", path, NULL, NULL, NULL, &resp);
+            if (r == 1) {
+                dispatch_response(resp.data);
+                stats_inc(&g_stats_sent);
+            } else {
+                stats_inc(&g_stats_dropped);
+                if (r == -1) { transport_ok = 0; break; }
+            }
+        }
+
+        /* seeds poll: pull any feed entries past the last cursor; the
+         * cursor watermark keeps this lossless across reconnects */
+        {
+            char path[64];
+            unsigned long long new_cursor = 0;
+            snprintf(path, sizeof(path), "/ms-sim/seeds?since=%llu",
+                     g_seed_cursor);
+            int r = http_exchange("GET", path, NULL, NULL, &new_cursor, &resp);
+            if (r == 1) {
+                dispatch_response(resp.data);
+                if (new_cursor > g_seed_cursor) g_seed_cursor = new_cursor;
+            } else if (r == -1) {
+                transport_ok = 0;
+            }
+            if (!transport_ok) break;
+        }
+
+        /* heartbeat: a periodic metrics POST keeps the session alive even
+         * when the player produced no metrics this round */
+        if (ms_now_ms() - last_beat >= BEAT_MS) {
+            last_beat = ms_now_ms();
+            if (metric_n == 0) {
+                char hb[96];
+                snprintf(hb, sizeof(hb), "metric heartbeat t=%llu",
+                         (unsigned long long)ms_now_ms());
+                int r = http_exchange("POST", "/ms-sim/metrics",
+                                      HTTP_POST_HEADERS, hb, NULL, &resp);
+                if (r == -1) { transport_ok = 0; break; }
+            }
+        }
+        http_buf_free(&resp);
+    }
+    g_connected = 0;
+}
+#endif /* MS_HTTP */
+
 /* ------------------------------------------------------------------ */
 /* connect + session loop (network thread)                             */
 /* ------------------------------------------------------------------ */
@@ -564,15 +992,16 @@ static int conn_loop(int s) {
 }
 
 static void *telemetry_thread(void *arg) {
+#ifdef MS_HTTP
+    int gen = (int)(intptr_t)arg;
+#else
     (void)arg;
+#endif
     while (g_running) {
-        int s = -1;
         stats_inc(&g_stats_attempts);
-        if (tcp_connect(g_host, g_port, &s)) {
-            g_sock = s;
-            conn_loop(s);
-            if (g_sock == s) g_sock = -1;
-            if (g_running) close(s);
+#ifdef MS_HTTP
+        if (g_http_mode != 0) {
+            http_run(gen);
             g_send_off = g_send_len = 0;
             if (g_send_metric_lines > 0) {
                 stats_add(&g_stats_dropped,
@@ -580,9 +1009,29 @@ static void *telemetry_thread(void *arg) {
                 g_send_metric_lines = 0;
             }
             if (!g_running) break;
+            for (int i = 0; i < RETRY_MS / 50 && g_running; i++)
+                usleep(50 * 1000);
+            continue;
         }
-        for (int i = 0; i < RETRY_MS / 50 && g_running; i++)
-            usleep(50 * 1000);
+#endif
+        {
+            int s = -1;
+            if (tcp_connect(g_host, g_port, &s)) {
+                g_sock = s;
+                conn_loop(s);
+                if (g_sock == s) g_sock = -1;
+                if (g_running) close(s);
+                g_send_off = g_send_len = 0;
+                if (g_send_metric_lines > 0) {
+                    stats_add(&g_stats_dropped,
+                              (unsigned long long)g_send_metric_lines);
+                    g_send_metric_lines = 0;
+                }
+                if (!g_running) break;
+            }
+            for (int i = 0; i < RETRY_MS / 50 && g_running; i++)
+                usleep(50 * 1000);
+        }
     }
     return NULL;
 }
@@ -604,10 +1053,25 @@ int net_telemetry_start(const char *host, unsigned short port) {
     g_q_head = g_q_count = 0;
 
     __atomic_store_n(&g_running, 1, __ATOMIC_RELEASE);
+#ifdef MS_HTTP
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        __atomic_store_n(&g_running, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+    {
+        int gen = __atomic_add_fetch(&g_session_gen, 1, __ATOMIC_RELEASE);
+        if (pthread_create(&g_thread, NULL, telemetry_thread,
+                           (void *)(intptr_t)gen) != 0) {
+            __atomic_store_n(&g_running, 0, __ATOMIC_RELEASE);
+            return 0;
+        }
+    }
+#else
     if (pthread_create(&g_thread, NULL, telemetry_thread, NULL) != 0) {
         __atomic_store_n(&g_running, 0, __ATOMIC_RELEASE);
         return 0;
     }
+#endif
     g_thread_up = 1;
     return 1;
 }
@@ -628,6 +1092,29 @@ void net_telemetry_stop(void) {
 
 int net_telemetry_active(void) {
     return g_running ? 1 : 0;
+}
+
+/* HTTP(S) transport selection for the telemetry session.  mode 0 (default)
+ * is the raw TCP stream; 1 is plain HTTP and 2 is HTTPS (both via libcurl,
+ * which terminates TLS with OpenSSL).  Set before net_telemetry_start().
+ * Without libcurl (make without MS_HTTP=1) this is a no-op. */
+void net_set_http_mode(int mode) {
+#ifdef MS_HTTP
+    g_http_mode = (mode == 1 || mode == 2) ? mode : 0;
+#else
+    (void)mode;
+#endif
+}
+
+/* When non-zero, --telemetry-https skips libcurl certificate validation
+ * (debug/testing only; production endpoints use a CA-signed certificate).
+ * Without libcurl (make without MS_HTTP=1) this is a no-op. */
+void net_set_https_insecure(int on) {
+#ifdef MS_HTTP
+    g_https_insecure = on ? 1 : 0;
+#else
+    (void)on;
+#endif
 }
 
 void net_telemetry_endpoint(char *host, size_t hsz, unsigned short *port) {

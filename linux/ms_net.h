@@ -34,6 +34,19 @@ int  net_telemetry_start(const char *host, unsigned short port);
 void net_telemetry_stop(void);
 int  net_telemetry_active(void);
 
+/* HTTP(S) transport selection for the telemetry session.  mode 0 (default)
+ * is the raw TCP stream; 1 is plain HTTP and 2 is HTTPS.  Both HTTP modes
+ * go through libcurl (TLS via OpenSSL), mirroring the /ms-sim/ endpoints
+ * of the simulation server, and are selected with --telemetry-http /
+ * --telemetry-https.  Only available when the client is built with libcurl
+ * (make MS_HTTP=1); otherwise these are no-ops and the raw stream is used.
+ * Set before net_telemetry_start(). */
+void net_set_http_mode(int mode);
+
+/* When on, HTTP(S) mode skips libcurl certificate validation.  Debug/testing
+ * only (--telemetry-https-insecure); production uses a CA-signed cert. */
+void net_set_https_insecure(int on);
+
 /* Last-configured telemetry endpoint (the production default until the
  * first start()).  Lets callers restart the session against the endpoint the
  * user actually selected instead of a hardcoded host. */

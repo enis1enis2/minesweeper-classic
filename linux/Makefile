@@ -8,6 +8,10 @@
 #   make dynamic    build a dynamically linked client (smaller, needs libX11)
 #   make headless   build a static client without X11 (terminal + headless)
 #   make clean
+#
+# HTTP(S) telemetry transport (libcurl):
+#   make MS_HTTP=1           add the /ms-sim/ HTTP(S) transport (needs libcurl)
+#   make MS_HTTP=1 dynamic   same, dynamically linked (needs libcurl4-openssl-dev)
 
 CC      ?= gcc
 CFLAGS  ?= -O2
@@ -16,6 +20,11 @@ CFLAGS  += -std=c11 -Wall -Wextra -pthread -I. -I../src \
 
 X11_LIBS := -lX11 -lxcb -lXdmcp -lXau
 LDLIBS   := -lpthread -lm
+
+ifdef MS_HTTP
+CFLAGS  += -DMS_HTTP
+LDLIBS  += -lcurl
+endif
 
 SRC      := ms_core.c ms_net.c ms_sha256.c ms_ini.c ms_term.c ms_main.c
 X11_SRC  := ms_x11.c
