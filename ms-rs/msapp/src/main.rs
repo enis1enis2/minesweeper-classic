@@ -25,11 +25,12 @@ struct Cli {
 
 impl Default for Cli {
     fn default() -> Self {
+        let (host, port) = core::default_endpoint();
         Cli {
             listen_port: 0,
             seed_args: Vec::new(),
-            telemetry_host: "135.125.79.15".to_string(),
-            telemetry_port: 28571,
+            telemetry_host: host,
+            telemetry_port: port,
             solver_user: None,
             solver_pass: None,
             solver_config: None,

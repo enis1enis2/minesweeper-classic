@@ -13,6 +13,7 @@
  */
 #include "ms_net.h"
 #include "ms_sha256.h"
+#include "ms_endpoint.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -54,8 +55,8 @@ static const int g_diff_count = (int)(sizeof(g_diff_names_t) / sizeof(g_diff_nam
 
 /* ---- connection state (written by the network thread only) ---- */
 static int   g_sock = -1;
-static char  g_host[64] = "135.125.79.15";
-static unsigned short g_port = 28571;
+static char  g_host[64];
+static unsigned short g_port;
 static int   g_connected = 0;
 
 /* A remote-simulation session is active from the moment a req* line is
@@ -631,10 +632,13 @@ int net_telemetry_active(void) {
 
 void net_telemetry_endpoint(char *host, size_t hsz, unsigned short *port) {
     if (host && hsz) {
-        strncpy(host, g_host, hsz - 1);
+        if (g_host[0])
+            strncpy(host, g_host, hsz - 1);
+        else
+            ms_endpoint_default_host(host, hsz); /* never started yet */
         host[hsz - 1] = 0;
     }
-    if (port) *port = g_port;
+    if (port) *port = g_port ? g_port : (unsigned short)ms_endpoint_default_port();
 }
 
 void ms_net_setup_sinks(void) {

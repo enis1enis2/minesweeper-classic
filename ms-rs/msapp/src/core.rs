@@ -10,6 +10,53 @@ pub const AUTH_WAIT_CHAL: u8 = 1;
 pub const AUTH_WAIT_OK: u8 = 2;
 pub const AUTH_OK: u8 = 3;
 
+/* Default telemetry endpoint, stored base64 so the deployed server address
+ * is not a readable string in the source/binary.  Obfuscation only — the
+ * value is recovered at runtime and sent in the clear on the telemetry
+ * link; --telemetry / --no-telemetry still override it. */
+const DEFAULT_HOST_B64: &str = "MTM1LjEyNS43OS4xNQ=="; /* 135.125.79.15 */
+const DEFAULT_PORT_B64: &str = "Mjg1NzE=";              /* 28571 */
+
+fn b64_val(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+        b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn b64_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut v: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        let Some(d) = b64_val(c) else {
+            continue;
+        };
+        v = (v << 6) | d;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((v >> bits) & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+pub fn default_endpoint() -> (String, u16) {
+    let host = String::from_utf8_lossy(&b64_decode(DEFAULT_HOST_B64)).into_owned();
+    let port = String::from_utf8_lossy(&b64_decode(DEFAULT_PORT_B64))
+        .parse::<u16>()
+        .unwrap_or(28571);
+    (host, port)
+}
+
 #[derive(Clone, Debug)]
 pub struct LbEntry {
     pub rank: u32,
@@ -45,10 +92,11 @@ pub struct Core {
 
 impl Core {
     pub fn new() -> Self {
+        let (host, port) = default_endpoint();
         Core {
             game: Game::new(),
-            host: "135.125.79.15".to_string(),
-            port: 28571,
+            host,
+            port,
             solver_user: String::new(),
             solver_pass: String::new(),
             telemetry_on: true,

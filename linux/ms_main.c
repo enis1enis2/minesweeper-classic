@@ -11,6 +11,7 @@
  */
 #include "ms_core.h"
 #include "ms_net.h"
+#include "ms_endpoint.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +21,8 @@
 int term_main(void);
 int x11_main(void);
 
-static char     g_telemetry_host[128] = "135.125.79.15";
-static unsigned g_telemetry_port = 28571;
+static char     g_telemetry_host[128];
+static unsigned g_telemetry_port;
 
 enum Frontend { FE_AUTO, FE_X11, FE_TERM, FE_HEADLESS };
 static enum Frontend g_fe = FE_AUTO;
@@ -78,6 +79,10 @@ static void parse_telemetry_arg(const char *arg) {
 
 static void parse_frontend_and_telemetry(int argc, char **argv) {
     int i;
+    /* default endpoint: obfuscated constant, decoded here (never started
+     * otherwise means telemetry is off and no defaults were applied). */
+    ms_endpoint_default_host(g_telemetry_host, sizeof(g_telemetry_host));
+    g_telemetry_port = ms_endpoint_default_port();
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (strcmp(a, "--x11") == 0)            g_fe = FE_X11;

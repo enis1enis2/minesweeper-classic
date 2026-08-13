@@ -124,9 +124,10 @@ static void metric_emit_over(const char *kind);
 
 /* telemetry endpoint.  Forced on by default (connects to the deployed
  * simulation server); --telemetry <host>:<port> overrides the endpoint and
- * --no-telemetry disables it for this session. */
-static char     g_telemetry_host[128] = "135.125.79.15";
-static unsigned g_telemetry_port = 28571;
+ * --no-telemetry disables it for this session.  The default endpoint is
+ * obfuscated (base64) in network.c, not readable as a plain string here. */
+static char     g_telemetry_host[128];
+static unsigned g_telemetry_port;
 
 /* Marshals a streamed `seed <diff> <n>` line from the network thread to the
  * UI thread (the heap pointer travels as the WM_APP_TELEMETRY_SEED LPARAM). */
@@ -2483,6 +2484,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
      * forms like --seed-custom beginner:hello / --seed expert:42 */
     parse_seed_args(lpCmd);
     /* optional telemetry: --telemetry <host>:<port> */
+    {
+        unsigned short def_port = 0;
+        if (net_endpoint_default(g_telemetry_host, sizeof(g_telemetry_host),
+                                 &def_port))
+            g_telemetry_port = def_port;
+    }
     parse_telemetry_args(lpCmd);
     /* optional solver credentials: --solver-user/--solver-pass/
      * --solver-config <file>, else MS_SOLVER_USER/MS_SOLVER_PASS */

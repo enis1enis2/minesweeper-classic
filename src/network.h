@@ -100,6 +100,12 @@ int  net_telemetry_start(const char *host, unsigned short port);
 void net_telemetry_stop(void);
 int  net_telemetry_active(void);
 
+/* Decode the obfuscated (base64) default telemetry endpoint into host
+ * (NUL-terminated, up to hsz bytes) and *port.  Obfuscation only — the value
+ * must be recoverable at runtime and is still sent in the clear on the wire.
+ * Returns 1 on success. */
+int  net_endpoint_default(char *host, size_t hsz, unsigned short *port);
+
 /* Register the callback that receives streamed `seed <diff> <n>` lines.
  * The callback runs on the network thread; keep it cheap or marshal to the
  * UI thread (the game does the latter). */
