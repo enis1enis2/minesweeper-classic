@@ -9,9 +9,15 @@
  */
 #include "ms_ini.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#if defined(_WIN32)
+#include <direct.h> /* _mkdir */
+#endif
 
 static char g_path[1024];
 static int  g_path_ready = 0;
@@ -34,23 +40,42 @@ const char *ms_ini_path(void) {
     return g_path;
 }
 
+/* POSIX mkdir(path, mode); the Win32 CRT only takes the path. */
+#if defined(_WIN32)
+static int mkdir1(const char *path) { return _mkdir(path); }
+#else
+static int mkdir1(const char *path) { return mkdir(path, 0755); }
+#endif
+
 static void mkdirs_for_path(const char *path) {
-    /* create the parent directory if missing (mkdir -p of a single level) */
-    char dir[1024];
+    /* Create the parent directory if missing, one component at a time.
+     * Never shell out (no system()/popen()): the path is derived from
+     * user-controlled $HOME / $XDG_CONFIG_HOME, so quoting it into a shell
+     * command line would be a command-injection hole on the first config
+     * write (a single quote in the home dir breaks out of the quotes). */
     const char *slash = strrchr(path, '/');
     if (!slash || slash == path) return;
+    char dir[1024];
+    size_t n = (size_t)(slash - path);
+    if (n >= sizeof(dir)) return;
+    memcpy(dir, path, n);
+    dir[n] = 0;
+    if (!dir[0]) return;
     {
-        size_t n = (size_t)(slash - path);
-        if (n >= sizeof(dir)) return;
-        memcpy(dir, path, n);
-        dir[n] = 0;
-    }
-    if (dir[0]) {
-        char cmd[1200];
-        int rc;
-        snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dir);
-        rc = system(cmd);
-        (void)rc;
+        char tmp[1024];
+        size_t i = 0;
+        if (n >= sizeof(tmp)) return;
+        memcpy(tmp, dir, n + 1);
+        /* skip any leading slashes so we mkdir absolute paths in place */
+        while (tmp[i] == '/') i++;
+        for (; tmp[i]; i++) {
+            if (tmp[i] == '/') {
+                tmp[i] = 0;
+                if (mkdir1(tmp) != 0 && errno != EEXIST) return;
+                tmp[i] = '/';
+            }
+        }
+        if (mkdir1(tmp) != 0 && errno != EEXIST) return;
     }
 }
 
@@ -112,6 +137,11 @@ int ms_ini_get_str(const char *sec, const char *key, const char *def,
         if (secp) {
             const char *p = secp;
             size_t klen = strlen(key);
+            /* skip the [sec] header line itself, then scan its keys */
+            {
+                const char *nl = strchr(p, '\n');
+                if (nl) p = nl + 1;
+            }
             while (p && *p) {
                 const char *nl = strchr(p, '\n');
                 const char *line_end = nl ? nl : p + strlen(p);

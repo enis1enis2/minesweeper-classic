@@ -49,8 +49,13 @@ headless: $(OBJ) $(ANALYZE_OBJ)
 	$(CC) -static $(CFLAGS) -o minesweeper-headless $(OBJ) $(ANALYZE_OBJ) \
 	    $(LDLIBS)
 
+# regression test: ini config path must never be shelled out
+test: ms_ini.o test/ms_ini_shell.o
+	$(CC) $(CFLAGS) -o ms_ini_shell_test ms_ini.o test/ms_ini_shell.o
+	./ms_ini_shell_test
+
 clean:
 	rm -f $(OBJ) $(X11_OBJ) $(ANALYZE_OBJ) minesweeper minesweeper-dyn \
-	    minesweeper-headless
+	    minesweeper-headless ms_ini_shell_test test/ms_ini_shell.o
 
-.PHONY: all dynamic headless clean
+.PHONY: all dynamic headless test clean
