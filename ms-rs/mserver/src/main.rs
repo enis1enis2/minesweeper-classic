@@ -11,13 +11,14 @@
 mod config;
 mod crypto;
 mod db;
+mod http;
 mod hub;
 mod protocol;
 mod worker;
 mod worker_pool;
 
 use crate::db::Database;
-use crate::hub::{AdmissionGate, ClientHub, RequestWorkers};
+use crate::hub::{AdmissionGate, AuthStore, ClientHub, FeedBuffer, RequestWorkers};
 use crate::protocol::{Server, handle_conn, produce};
 use crate::worker_pool::WorkerPool;
 use futures::FutureExt;
@@ -45,6 +46,8 @@ struct Args {
     tls_port: Option<u16>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    http_port: Option<u16>,
+    https_port: Option<u16>,
 }
 
 fn parse_args() -> Result<Args, i32> {
@@ -62,6 +65,8 @@ fn parse_args() -> Result<Args, i32> {
     let mut tls_port: Option<String> = None;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut http_port: Option<String> = None;
+    let mut https_port: Option<String> = None;
     let mut selfcheck = false;
     let mut help = false;
 
@@ -82,6 +87,8 @@ fn parse_args() -> Result<Args, i32> {
             "--tls-port" => tls_port = Some(args.next().unwrap_or_default()),
             "--tls-cert" => tls_cert = Some(args.next().unwrap_or_default()),
             "--tls-key" => tls_key = Some(args.next().unwrap_or_default()),
+            "--http-port" => http_port = Some(args.next().unwrap_or_default()),
+            "--https-port" => https_port = Some(args.next().unwrap_or_default()),
             "--selfcheck" => selfcheck = true,
             "--help" | "-h" => help = true,
             other => {
@@ -152,12 +159,18 @@ fn parse_args() -> Result<Args, i32> {
         }
     }
 
-    // TLS is all-or-nothing: --tls-port/--tls-cert/--tls-key must be given
-    // together. The plaintext port stays active either way.
-    let tls_present = tls_port.is_some() || tls_cert.is_some() || tls_key.is_some();
-    if tls_present && !(tls_port.is_some() && tls_cert.is_some() && tls_key.is_some()) {
+    // TLS is all-or-nothing: any of --tls-port/--https-port/--tls-cert/
+    // --tls-key must come as a complete set (cert+key plus at least one
+    // port). The plaintext TCP port stays active either way.
+    let tls_any =
+        tls_port.is_some() || https_port.is_some() || tls_cert.is_some() || tls_key.is_some();
+    if tls_any
+        && !(tls_cert.is_some()
+            && tls_key.is_some()
+            && (tls_port.is_some() || https_port.is_some()))
+    {
         eprintln!(
-            "ms_server: error: --tls-port, --tls-cert and --tls-key must be given together"
+            "ms_server: error: --tls-cert and --tls-key are required together with --tls-port and/or --https-port"
         );
         return Err(2);
     }
@@ -171,6 +184,20 @@ fn parse_args() -> Result<Args, i32> {
         }
         None => None,
     };
+    let parse_http = |name: &str, v: &Option<String>| -> Result<Option<u16>, i32> {
+        match v {
+            Some(p) => {
+                if !int_val(p) || p.parse::<u16>().is_err() {
+                    eprintln!("ms_server: error: invalid {} value: '{}'", name, p);
+                    return Err(2);
+                }
+                Ok(p.parse().ok())
+            }
+            None => Ok(None),
+        }
+    };
+    let http_port_val = parse_http("--http-port", &http_port)?;
+    let https_port_val = parse_http("--https-port", &https_port)?;
 
     Ok(Args {
         host,
@@ -187,6 +214,8 @@ fn parse_args() -> Result<Args, i32> {
         tls_port: tls_port_val,
         tls_cert,
         tls_key,
+        http_port: http_port_val,
+        https_port: https_port_val,
     })
 }
 
@@ -195,7 +224,8 @@ fn usage() {
         "usage: mserver [--host HOST] [--port PORT] [--db FILE] [--rate G/S] \
 [--difficulty all|beginner|intermediate|expert] [--seed N] [--max-request N] \
 [--max-concurrent N] [--solver-user USER --solver-pass PASS | --solver-config FILE] \
-[--tls-port PORT --tls-cert CERT.pem --tls-key KEY.pem] [--selfcheck]"
+[--tls-port PORT --tls-cert CERT.pem --tls-key KEY.pem] \
+[--http-port PORT] [--https-port PORT --tls-cert CERT.pem --tls-key KEY.pem] [--selfcheck]"
     );
 }
 
@@ -259,6 +289,8 @@ async fn main() {
         stop: AtomicBool::new(false),
         db: Arc::clone(&db),
         hub: Arc::clone(&hub),
+        auth: Arc::new(AuthStore::new()),
+        feed: FeedBuffer::new(),
         req_workers: Arc::clone(&req_workers),
         gate: Arc::clone(&gate),
         pool: Arc::clone(&pool),
@@ -294,17 +326,24 @@ async fn main() {
         if solver_enabled { "protected" } else { "disabled" }
     );
 
-    // Optional TLS listener (same wire protocol, encrypted). Plaintext port
-    // stays active so legacy C clients can keep connecting.
-    if let (Some(tls_port), Some(cert), Some(key)) = (&args.tls_port, &args.tls_cert, &args.tls_key) {
-        let tls_cfg = match load_tls_config(cert, key) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("ms_server: error: TLS: {}", e);
-                server.stop.store(true, Ordering::SeqCst);
-                std::process::exit(1);
-            }
+    // TLS config is shared by the TLS TCP listener and the HTTPS listener.
+    let tls_cfg: Option<rustls::ServerConfig> =
+        if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+            Some(match load_tls_config(cert, key) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("ms_server: error: TLS: {}", e);
+                    server.stop.store(true, Ordering::SeqCst);
+                    std::process::exit(1);
+                }
+            })
+        } else {
+            None
         };
+
+    // Optional TLS TCP listener (same wire protocol, encrypted). Plaintext
+    // port stays active so legacy C clients can keep connecting.
+    if let (Some(tls_port), Some(cfg)) = (&args.tls_port, &tls_cfg) {
         let tls_listener = match TcpListener::bind((args.host.as_str(), *tls_port)).await {
             Ok(l) => l,
             Err(e) => {
@@ -314,7 +353,7 @@ async fn main() {
         };
         let tls_bound = tls_listener.local_addr().unwrap().port();
         println!("ms_server TLS listening on {}:{}", args.host, tls_bound);
-        let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)));
+        let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(cfg.clone())));
         let tls_server = Arc::clone(&server);
         tokio::spawn(async move {
             loop {
@@ -346,6 +385,92 @@ async fn main() {
                     }
                     Err(_) => {
                         if tls_server.stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Plaintext HTTP(S) endpoints (sim protocol over HTTP, for nginx/Cloudflare
+    // front-proxying). Mirrors the /ms-diag/ingest model.
+    if let Some(http_port) = &args.http_port {
+        let http_listener = match TcpListener::bind((args.host.as_str(), *http_port)).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("ms_server: error: HTTP listen: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let http_bound = http_listener.local_addr().unwrap().port();
+        println!("ms_server HTTP listening on {}:{}", args.host, http_bound);
+        let http_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop {
+                match http_listener.accept().await {
+                    Ok((stream, peer)) => {
+                        let addr = fmt_peer(&peer);
+                        let srv = Arc::clone(&http_server);
+                        tokio::spawn(async move {
+                            if let Err(panic) =
+                                std::panic::AssertUnwindSafe(crate::http::handle_http_conn(srv, stream, addr.clone()))
+                                    .catch_unwind()
+                                    .await
+                            {
+                                eprintln!("conn {}: panic in HTTP connection handler: {:?}", addr, panic);
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        if http_server.stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Native TLS HTTP(S) endpoints, terminated by mserver itself.
+    if let (Some(https_port), Some(cfg)) = (&args.https_port, &tls_cfg) {
+        let https_listener = match TcpListener::bind((args.host.as_str(), *https_port)).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("ms_server: error: HTTPS listen: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let https_bound = https_listener.local_addr().unwrap().port();
+        println!("ms_server HTTPS listening on {}:{}", args.host, https_bound);
+        let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(cfg.clone())));
+        let https_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop {
+                match https_listener.accept().await {
+                    Ok((stream, peer)) => {
+                        let addr = fmt_peer(&peer);
+                        let srv = Arc::clone(&https_server);
+                        let acc = Arc::clone(&acceptor);
+                        tokio::spawn(async move {
+                            let tls_stream = match acc.accept(stream).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("conn {}: HTTPS handshake failed: {}", addr, e);
+                                    return;
+                                }
+                            };
+                            if let Err(panic) =
+                                std::panic::AssertUnwindSafe(crate::http::handle_http_conn(srv, tls_stream, addr.clone()))
+                                    .catch_unwind()
+                                    .await
+                            {
+                                eprintln!("conn {}: panic in HTTPS connection handler: {:?}", addr, panic);
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        if https_server.stop.load(Ordering::SeqCst) {
                             break;
                         }
                     }

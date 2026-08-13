@@ -19,22 +19,142 @@ pub struct Client {
     pub last: i64,
     pub seeds: u64,
     pub outcomes: u64,
-    pub user: Option<String>,
-    pub nonce: Option<String>,
-    pub nonce_ts: i64,
-    pub fails: i64,
-    pub authed: bool,
     pub dead: bool,
-}
-
-pub struct ClientSnapshot {
-    pub user: Option<String>,
-    pub nonce: Option<String>,
 }
 
 pub struct ClientHub {
     db: Arc<Database>,
     clients: Mutex<HashMap<String, Client>>,
+}
+
+/// HMAC challenge/response auth state, keyed by an arbitrary identity string.
+/// TCP connections use the full `ip:port` (matching hub.js, where lockout
+/// drops one connection and a new connection starts fresh); the HTTP(S)
+/// endpoints key by source IP so the two-request challenge can span separate
+/// connections.
+pub struct AuthStore {
+    state: Mutex<HashMap<String, AuthEntry>>,
+}
+
+#[derive(Default)]
+struct AuthEntry {
+    user: Option<String>,
+    nonce: Option<String>,
+    nonce_ts: i64,
+    fails: i64,
+    authed: bool,
+}
+
+impl AuthStore {
+    pub fn new() -> AuthStore {
+        AuthStore {
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn auth_begin(&self, key: &str, user: &str) -> Option<String> {
+        let mut m = self.state.lock().await;
+        let e = m.entry(key.to_string()).or_insert_with(AuthEntry::default);
+        e.user = Some(user.to_string());
+        let nonce = random_hex(16);
+        e.nonce = Some(nonce.clone());
+        e.nonce_ts = now_sec();
+        Some(nonce)
+    }
+
+    /// `(nonce, user)` when a challenge is outstanding for this key.
+    pub async fn get(&self, key: &str) -> Option<(String, String)> {
+        let m = self.state.lock().await;
+        let e = m.get(key)?;
+        Some((e.nonce.clone()?, e.user.clone()?))
+    }
+
+    /// `(ok, fails)` — mirrors auth_resolve.
+    pub async fn auth_resolve(&self, key: &str, digest_hex: &str, expected_hex: &str) -> (bool, i64) {
+        let mut m = self.state.lock().await;
+        let e = match m.get_mut(key) {
+            Some(e) => e,
+            None => return (false, 0),
+        };
+        let nonce_ts = e.nonce_ts;
+        if now_sec() - nonce_ts > NONCE_TTL {
+            e.fails += 1;
+            return (false, e.fails);
+        }
+        let ok = timing_safe_eq(&digest_hex.to_lowercase(), expected_hex);
+        e.nonce = None;
+        if ok {
+            e.authed = true;
+            e.fails = 0;
+        } else {
+            e.fails += 1;
+        }
+        (ok, e.fails)
+    }
+
+    pub async fn is_authed(&self, key: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .get(key)
+            .map(|e| e.authed)
+            .unwrap_or(false)
+    }
+
+    pub async fn clear(&self, key: &str) {
+        self.state.lock().await.remove(key);
+    }
+}
+
+/// Ring buffer of broadcast `seed`/`outcome` lines with monotonic ids, so
+/// HTTP(S) clients can poll `GET /ms-sim/seeds?since=N` and replay the stream
+/// without a persistent connection.
+pub struct FeedBuffer {
+    inner: std::sync::Mutex<FeedInner>,
+}
+
+const FEED_CAP: usize = 10000;
+
+struct FeedInner {
+    next: u64,
+    entries: VecDeque<(u64, String)>,
+}
+
+impl FeedBuffer {
+    pub fn new() -> Arc<FeedBuffer> {
+        Arc::new(FeedBuffer {
+            inner: std::sync::Mutex::new(FeedInner {
+                next: 1,
+                entries: VecDeque::new(),
+            }),
+        })
+    }
+
+    /// Append a broadcast line; returns its id.
+    pub fn push(&self, line: &str) -> u64 {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let id = g.next;
+        g.next += 1;
+        if g.entries.len() >= FEED_CAP {
+            g.entries.pop_front();
+        }
+        g.entries.push_back((id, line.to_string()));
+        id
+    }
+
+    /// Lines with id > `from`, plus the newest id (0 when nothing new).
+    pub fn since(&self, from: u64) -> (Vec<String>, u64) {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::new();
+        let mut newest = 0;
+        for (id, line) in g.entries.iter() {
+            if *id > from {
+                out.push(line.clone());
+                newest = *id;
+            }
+        }
+        (out, newest)
+    }
 }
 
 impl ClientHub {
@@ -52,62 +172,12 @@ impl ClientHub {
             last: now,
             seeds: 0,
             outcomes: 0,
-            user: None,
-            nonce: None,
-            nonce_ts: 0,
-            fails: 0,
-            authed: false,
             dead: false,
         };
         self.clients.lock().await.insert(addr.clone(), cl);
         if let Err(e) = self.db.upsert_client(&addr, now, true) {
             eprintln!("  hub: upsert_client {} failed: {}", addr, e);
         }
-    }
-
-    pub async fn is_authed(&self, addr: &str) -> bool {
-        self.clients.lock().await.get(addr).map(|c| c.authed).unwrap_or(false)
-    }
-
-    pub async fn get(&self, addr: &str) -> Option<ClientSnapshot> {
-        let m = self.clients.lock().await;
-        m.get(addr).map(|cl| ClientSnapshot {
-            user: cl.user.clone(),
-            nonce: cl.nonce.clone(),
-        })
-    }
-
-    pub async fn auth_begin(&self, addr: &str, user: &str) -> Option<String> {
-        let mut m = self.clients.lock().await;
-        let cl = m.get_mut(addr)?;
-        cl.user = Some(user.to_string());
-        let nonce = random_hex(16);
-        cl.nonce = Some(nonce.clone());
-        cl.nonce_ts = now_sec();
-        Some(nonce)
-    }
-
-    /// `(ok, fails)` — mirrors auth_resolve.
-    pub async fn auth_resolve(&self, addr: &str, digest_hex: &str, expected_hex: &str) -> (bool, i64) {
-        let mut m = self.clients.lock().await;
-        let cl = match m.get_mut(addr) {
-            Some(cl) => cl,
-            None => return (false, 0),
-        };
-        let nonce_ts = cl.nonce_ts;
-        if now_sec() - nonce_ts > NONCE_TTL {
-            cl.fails += 1;
-            return (false, cl.fails);
-        }
-        let ok = timing_safe_eq(&digest_hex.to_lowercase(), expected_hex);
-        cl.nonce = None;
-        if ok {
-            cl.authed = true;
-            cl.fails = 0;
-        } else {
-            cl.fails += 1;
-        }
-        (ok, cl.fails)
     }
 
     pub async fn remove(&self, addr: &str) {

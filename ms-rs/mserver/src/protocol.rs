@@ -4,7 +4,7 @@
 use crate::config::{self, HEAVY_CPU_SECONDS, LB_MAX, LB_MAX_IPS, LB_WINDOW, MAX_AUTH_FAILS, MAX_LINE};
 use crate::crypto::{hmac_sha256_hex, timing_safe_eq};
 use crate::db::{Database, GameRow, now_sec};
-use crate::hub::{AdmissionGate, ClientHub, ClientWriter, RequestWorkers};
+use crate::hub::{AdmissionGate, AuthStore, ClientHub, ClientWriter, FeedBuffer, RequestWorkers};
 use crate::worker_pool::WorkerPool;
 use crate::worker::Task;
 use futures::FutureExt;
@@ -68,6 +68,8 @@ pub struct Server {
     pub stop: AtomicBool,
     pub db: Arc<Database>,
     pub hub: Arc<ClientHub>,
+    pub auth: Arc<AuthStore>,
+    pub feed: Arc<FeedBuffer>,
     pub req_workers: Arc<RequestWorkers>,
     pub gate: Arc<AdmissionGate>,
     pub pool: Arc<WorkerPool>,
@@ -84,6 +86,23 @@ pub struct Server {
 impl Server {
     fn mono_now(&self) -> f64 {
         self.base.elapsed().as_secs_f64()
+    }
+}
+
+/// Where protocol replies are written. The TCP path writes to the client's
+/// hub writer; the HTTP(S) path collects lines into the response body.
+pub trait LineSink {
+    async fn send(&self, line: &str) -> bool;
+}
+
+pub struct HubSink<'a> {
+    pub hub: &'a ClientHub,
+    pub addr: &'a str,
+}
+
+impl LineSink for HubSink<'_> {
+    async fn send(&self, line: &str) -> bool {
+        self.hub.send_to(self.addr, line).await
     }
 }
 
@@ -133,7 +152,7 @@ async fn handle_auth(server: &Server, addr: &str, line: &str) {
         eprintln!("  auth: unknown user {:?} from {}", user, addr);
         return;
     }
-    let nonce = server.hub.auth_begin(addr, user).await;
+    let nonce = server.auth.auth_begin(addr, user).await;
     match nonce {
         Some(n) => {
             server.hub.send_to(addr, &format!("authchal {}", n)).await;
@@ -151,20 +170,15 @@ async fn handle_authresp(server: &Server, addr: &str, line: &str) -> bool {
         server.hub.send_to(addr, "autherr").await;
         return true;
     }
-    let cl = server.hub.get(addr).await;
-    let (nonce, user) = match cl {
-        Some(c) => (c.nonce, c.user),
-        None => (None, None),
-    };
-    let nonce = match nonce {
-        Some(n) => n,
+    let (nonce, user) = match server.auth.get(addr).await {
+        Some(v) => v,
         None => {
             server.hub.send_to(addr, "autherr").await;
             return true;
         }
     };
     let expected = hmac_sha256_hex(server.solver_pass.as_bytes(), format!("ms-auth:{}", nonce).as_bytes());
-    let (ok, fails) = server.hub.auth_resolve(addr, &toks[1], &expected).await;
+    let (ok, fails) = server.auth.auth_resolve(addr, &toks[1], &expected).await;
     if ok {
         server.hub.send_to(addr, "authok").await;
         eprintln!("  auth: ok user={:?} from {}", user, addr);
@@ -180,7 +194,7 @@ async fn handle_authresp(server: &Server, addr: &str, line: &str) -> bool {
     }
 }
 
-async fn handle_lbscore(server: &Server, addr: &str, line: &str) {
+pub async fn handle_lbscore<S: LineSink>(server: &Server, sink: &S, addr: &str, line: &str) {
     let toks = split_tokens(line);
     if toks.len() != 4 {
         return;
@@ -247,28 +261,25 @@ async fn handle_lbscore(server: &Server, addr: &str, line: &str) {
         }
     };
     if let Some(reply) = verdict {
-        server.hub.send_to(addr, reply).await;
+        sink.send(reply).await;
         return;
     }
     let (improved, rank) = match server.db.record_score(&name, &diff, ms) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("  lbscore: record_score failed: {}", e);
-            server.hub.send_to(addr, "lbnotop").await;
+            sink.send("lbnotop").await;
             return;
         }
     };
     if improved {
-        server
-            .hub
-            .send_to(addr, &format!("lbstored {} {} {} {}", rank, diff, name, ms))
-            .await;
+        sink.send(&format!("lbstored {} {} {} {}", rank, diff, name, ms)).await;
     } else {
-        server.hub.send_to(addr, "lbnotop").await;
+        sink.send("lbnotop").await;
     }
 }
 
-async fn handle_lbtop(server: &Server, addr: &str, line: &str) {
+pub async fn handle_lbtop<S: LineSink>(server: &Server, sink: &S, _addr: &str, line: &str) {
     let toks = split_tokens(line);
     let mut count: u64 = 10;
     let mut diff: Option<String> = None;
@@ -298,29 +309,23 @@ async fn handle_lbtop(server: &Server, addr: &str, line: &str) {
     };
     match &diff {
         None => {
-            server.hub.send_to(addr, &format!("lbtop {}", entries.len())).await;
+            sink.send(&format!("lbtop {}", entries.len())).await;
         }
         Some(d) => {
-            server
-                .hub
-                .send_to(addr, &format!("lbtop {} {}", d, entries.len()))
-                .await;
+            sink.send(&format!("lbtop {} {}", d, entries.len())).await;
         }
     }
     for (rank, name, d, ms, ts) in &entries {
-        server
-            .hub
-            .send_to(addr, &format!("lbentry {} {} {} {} {}", rank, d, name, ms, ts))
-            .await;
+        sink.send(&format!("lbentry {} {} {} {} {}", rank, d, name, ms, ts)).await;
     }
-    server.hub.send_to(addr, "lbdone").await;
+    sink.send("lbdone").await;
 }
 
 /// handleRequest: a requested batch of games for one client, run strictly in
 /// FIFO order on that client's request worker.
-async fn handle_request(server: &Server, addr: &str, line: &str) {
-    if !server.solver_enabled || !server.hub.is_authed(addr).await {
-        server.hub.send_to(addr, "reqdenied").await;
+pub async fn handle_request<S: LineSink>(server: &Server, sink: &S, addr: &str, line: &str) {
+    if !server.solver_enabled || !server.auth.is_authed(addr).await {
+        sink.send("reqdenied").await;
         return;
     }
     let toks = split_tokens(line);
@@ -374,20 +379,17 @@ async fn handle_request(server: &Server, addr: &str, line: &str) {
 
     let heavy = (count as f64) * config::game_cpu_seconds(&diff) >= HEAVY_CPU_SECONDS;
     if heavy {
-        server
-            .hub
-            .send_to(
-                addr,
-                &format!(
-                    "reqwait {} {}",
-                    diff,
-                    seed.map(|s| s.to_string()).unwrap_or_else(|| count.to_string())
-                ),
-            )
-            .await;
+        sink.send(
+            &format!(
+                "reqwait {} {}",
+                diff,
+                seed.map(|s| s.to_string()).unwrap_or_else(|| count.to_string())
+            ),
+        )
+        .await;
         server.gate.acquire().await;
     }
-    let result = run_batch(server, addr, &diff, seed, count, until).await;
+    let result = run_batch(server, sink, addr, &diff, seed, count, until).await;
     if heavy {
         server.gate.release().await;
     }
@@ -399,8 +401,9 @@ async fn handle_request(server: &Server, addr: &str, line: &str) {
 /// Run one requested batch of games for a single client on its FIFO request
 /// worker. Returns Err on a server-side failure (worker pool down / client
 /// gone); the admission gate is released by `handle_request` regardless.
-async fn run_batch(
+async fn run_batch<S: LineSink>(
     server: &Server,
+    sink: &S,
     addr: &str,
     diff: &str,
     seed: Option<i128>,
@@ -436,11 +439,7 @@ async fn run_batch(
         // negative seeds seed the decision RNG like `Random(BigInt(...))`.
         let decision = s ^ (run as i128) << 32;
         let decision_seed = decision.unsigned_abs() as u64;
-        if !server
-            .hub
-            .send_to(addr, &format!("reqgame {} {}", diff, s_wire))
-            .await
-        {
+        if !sink.send(&format!("reqgame {} {}", diff, s_wire)).await {
             return Err("client disconnected".into());
         }
         let (g, _) = simulate_game(
@@ -454,18 +453,10 @@ async fn run_batch(
             },
         )
         .await?;
-        if !server
-            .hub
-            .send_to(addr, &format!("seed {} {}", diff, s_wire))
-            .await
-        {
+        if !sink.send(&format!("seed {} {}", diff, s_wire)).await {
             return Err("client disconnected".into());
         }
-        if !server
-            .hub
-            .send_to(addr, &outcome_line(diff, &s_wire, &g))
-            .await
-        {
+        if !sink.send(&outcome_line(diff, &s_wire, &g)).await {
             return Err("client disconnected".into());
         }
         played += 1;
@@ -477,35 +468,26 @@ async fn run_batch(
     if until {
         match loss {
             Some((w, moves, tms, guesses)) => {
-                server
-                    .hub
-                    .send_to(
-                        addr,
-                        &format!(
-                            "lossfound {} {} {} {} {} {} {}",
-                            diff,
-                            seed.unwrap_or(0),
-                            played - 1,
-                            w,
-                            moves,
-                            tms,
-                            guesses
-                        ),
-                    )
-                    .await;
+                sink.send(
+                    &format!(
+                        "lossfound {} {} {} {} {} {} {}",
+                        diff,
+                        seed.unwrap_or(0),
+                        played - 1,
+                        w,
+                        moves,
+                        tms,
+                        guesses
+                    ),
+                )
+                .await;
             }
             None => {
-                server
-                    .hub
-                    .send_to(addr, &format!("noloss {} {} {}", diff, seed.unwrap_or(0), played))
-                    .await;
+                sink.send(&format!("noloss {} {} {}", diff, seed.unwrap_or(0), played)).await;
             }
         }
     }
-    server
-        .hub
-        .send_to(addr, &format!("reqdone {} {}", diff, played))
-        .await;
+    sink.send(&format!("reqdone {} {}", diff, played)).await;
     Ok(())
 }
 
@@ -557,10 +539,12 @@ async fn produce_one(server: &Server, rng: &Arc<TokioMutex<Mt19937>>) {
                 r.restore(&st.0, st.1);
             }
             server.hub.broadcast(&format!("seed {} {}", diff, seed)).await;
-            server
-                .hub
-                .broadcast(&outcome_line(&diff, &seed.to_string(), &g))
-                .await;
+            let outcome = outcome_line(&diff, &seed.to_string(), &g);
+            server.hub.broadcast(&outcome).await;
+            // Mirror the broadcast into the poll buffer so HTTP(S) clients
+            // can replay the stream via GET /ms-sim/seeds?since=N.
+            server.feed.push(&format!("seed {} {}", diff, seed));
+            server.feed.push(&outcome);
         }
         Err(e) => {
             eprintln!("  produce: simulate failed: {}", e);
@@ -615,6 +599,7 @@ where
     }
     server.hub.remove(&addr).await;
     server.req_workers.drop_addr(&addr).await;
+    server.auth.clear(&addr).await;
 }
 
 async fn dispatch(server: &Arc<Server>, addr: &str, text: &str) -> bool {
@@ -629,14 +614,22 @@ async fn dispatch(server: &Arc<Server>, addr: &str, text: &str) -> bool {
             return false;
         }
     } else if text.starts_with("lbscore ") {
-        handle_lbscore(server, addr, text).await;
+        let sink = HubSink {
+            hub: &server.hub,
+            addr,
+        };
+        handle_lbscore(server, &sink, addr, text).await;
     } else if text == "lbtop" || text.starts_with("lbtop ") {
-        handle_lbtop(server, addr, text).await;
+        let sink = HubSink {
+            hub: &server.hub,
+            addr,
+        };
+        handle_lbtop(server, &sink, addr, text).await;
     } else if text.starts_with("reqseed ")
         || text.starts_with("reqbatch ")
         || text.starts_with("requntil ")
     {
-        if !server.solver_enabled || !server.hub.is_authed(addr).await {
+        if !server.solver_enabled || !server.auth.is_authed(addr).await {
             server.hub.send_to(addr, "reqdenied").await;
         } else {
             let srv = Arc::clone(server);
@@ -646,7 +639,11 @@ async fn dispatch(server: &Arc<Server>, addr: &str, text: &str) -> bool {
                 .enqueue(addr.to_string(), line, move |a, l| {
                     let srv = Arc::clone(&srv);
                     async move {
-                        handle_request(&srv, &a, &l).await;
+                        let sink = HubSink {
+                            hub: &srv.hub,
+                            addr: &a,
+                        };
+                        handle_request(&srv, &sink, &a, &l).await;
                     }
                 })
                 .await;
