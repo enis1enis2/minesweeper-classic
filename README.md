@@ -13,6 +13,9 @@ Windows release:
 This project is a clean-room reimplementation of the classic gameplay and
 look. It shares **no code with any Microsoft product**.
 
+See [SECURITY.md](SECURITY.md) for the threat model, hardening notes and
+secure-deployment guidance.
+
 ## Supported systems
 
 - Windows 7, 8.1, 10, 11 (32-bit and 64-bit)

@@ -25,6 +25,8 @@ __pycache__/
 node_modules/
 
 # Internal / operational documents (not for distribution)
+# Consolidated under docs/ 2026-08-13 (root-level names kept for strays).
+docs/
 memory-bank.md
 PROJECT_REPORT.md
 ARCHITECTURE_REPORT.md
