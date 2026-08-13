@@ -1,5 +1,5 @@
 /*
- * diag.c - opt-in device diagnostics for Minesweeper (Classic).
+ * diag.c - opt-out device diagnostics for Minesweeper (Classic).
  *
  * See diag.h for the collected-field contract and opt-out surface.
  *
@@ -37,6 +37,8 @@
 #define DIAG_CRASH_MAX   2048          /* crash text buffer (filter stack) */
 #define DIAG_STACK_MAX   8             /* stack frames captured at crash   */
 #define DIAG_PAYLOAD_MAX 16384         /* JSON body (thread stack)         */
+#define DIAG_SEND_ATTEMPTS 3           /* bounded retries for transport    */
+#define DIAG_RETRY_DELAY_MS 5000       /* pause between retry attempts     */
 
 static LONG CALLBACK diag_crash_filter(EXCEPTION_POINTERS *ep);
 
@@ -596,12 +598,17 @@ static int build_payload(char *out, size_t sz) {
 
 /* ---------- HTTPS delivery (worker thread) ---------- */
 
-static void http_post_json(const char *host, const char *path,
-                           const char *body) {
+/* POST one JSON payload over HTTPS.  Returns:
+ *    1  delivered (HTTP 2xx)  -- crash file (if any) is deleted
+ *    0  server answered but not 2xx (endpoint reachable; terminal, no retry)
+ *   -1  no HTTP response at all (DNS / connect / TLS / send / receive
+ *       failure) -- transient, caller may retry a bounded number of times */
+static int http_post_json(const char *host, const char *path,
+                          const char *body) {
     WCHAR whost[256], wpath[256];
     HINTERNET h = NULL, c = NULL, r = NULL;
     DWORD status = 0, status_len = sizeof status;
-    BOOL ok = FALSE;
+    BOOL ok = FALSE, got_status = FALSE;
     LPCWSTR headers = L"Content-Type: application/json\r\n"
                       L"Accept: application/json\r\n";
 
@@ -622,12 +629,11 @@ static void http_post_json(const char *host, const char *path,
                             (DWORD)strlen(body), (DWORD)strlen(body), 0))
         goto done;
     if (!WinHttpReceiveResponse(r, NULL)) goto done;
-    if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE |
-                                  WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX,
-                             &status, &status_len, WINHTTP_NO_HEADER_INDEX))
-        goto done;
-    ok = (status >= 200 && status < 300);
+    got_status = WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE |
+                                          WINHTTP_QUERY_FLAG_NUMBER,
+                                     WINHTTP_HEADER_NAME_BY_INDEX,
+                                     &status, &status_len, WINHTTP_NO_HEADER_INDEX);
+    ok = got_status && status >= 200 && status < 300;
 
 done:
     if (r) WinHttpCloseHandle(r);
@@ -636,16 +642,34 @@ done:
     if (ok) {
         if (g_ready && g_crash_path[0]) DeleteFileA(g_crash_path);
         diag_log("diag: delivered (HTTP %lu)", (unsigned long)status);
-    } else {
-        diag_log("diag: delivery failed (HTTP %lu)", (unsigned long)status);
+        return 1;
     }
+    if (got_status) {
+        diag_log("diag: delivery failed (HTTP %lu)", (unsigned long)status);
+        return 0;
+    }
+    diag_log("diag: delivery failed (no response: DNS/connect/TLS)");
+    return -1;
 }
 
 static DWORD WINAPI diag_send_thread(void *arg) {
     char body[DIAG_PAYLOAD_MAX];
+    int attempt, r = -1;
     (void)arg;
-    if (build_payload(body, sizeof body))
-        http_post_json(DIAG_HOST, DIAG_PATH, body);
+    if (!build_payload(body, sizeof body)) goto done;
+    for (attempt = 1; attempt <= DIAG_SEND_ATTEMPTS; attempt++) {
+        r = http_post_json(DIAG_HOST, DIAG_PATH, body);
+        if (r >= 0) break;   /* delivered, or the endpoint answered */
+        if (attempt < DIAG_SEND_ATTEMPTS) {
+            diag_log("diag: transport failure, retry %d/%d in %d ms",
+                     attempt, DIAG_SEND_ATTEMPTS, DIAG_RETRY_DELAY_MS);
+            Sleep(DIAG_RETRY_DELAY_MS);
+        }
+    }
+    if (r < 0)
+        diag_log("diag: giving up after %d attempts (fail-silent)",
+                 DIAG_SEND_ATTEMPTS);
+done:
     InterlockedExchange(&g_send_inflight, 0);
     return 0;
 }

@@ -1,0 +1,20 @@
+[package]
+name = "mserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mscore.workspace = true
+tokio.workspace = true
+rusqlite.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+scrypt.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+base64.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+serde_json = "1"
+ctrlc = "3"

@@ -1,5 +1,5 @@
 /*
- * diag.h - opt-in device diagnostics for Minesweeper (Classic).
+ * diag.h - opt-out device diagnostics for Minesweeper (Classic).
  *
  * Collects a fixed, disclosed set of device descriptors (OS version/build,
  * CPU model + core count, GPU model, RAM total, screen resolution/refresh,
@@ -21,7 +21,13 @@
 
 #define APP_VERSION "1.0.0"
 
-/* HTTPS (TLS) diagnostics endpoint, terminated by nginx + Let's Encrypt. */
+/* HTTPS (TLS) diagnostics endpoint, terminated by nginx + Let's Encrypt.
+ *
+ * The host is a dynamic-DNS name (dpdns.org): the ingest + admin service runs
+ * on a self-hosted deployment whose residential IP can change, so the client
+ * re-resolves DIAG_HOST at delivery time and can hit a transient DNS/connect
+ * failure while the record catches up.  diag.c therefore retries transport
+ * failures a bounded number of times, fail-silent (minesweeper.log only). */
 #define DIAG_HOST "admin.jellyfiner.dpdns.org"
 #define DIAG_PATH "/ms-diag/ingest"
 

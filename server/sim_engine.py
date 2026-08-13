@@ -19,6 +19,18 @@ import sys
 
 MASK64 = (1 << 64) - 1
 
+# A resolved seed of zero would leave xorshift64 stuck at zero forever (every
+# output step is x ^= x<<13 ^ x>>7 ^ x<<17 with x == 0), so seed 0 is mapped
+# onto a fixed nonzero constant.  This must stay identical in minesweeper.c
+# (RNG_ZERO_SEED_FALLBACK) and ms/core/sim-engine.js.
+ZERO_SEED_FALLBACK = 0x9E3779B97F4A7C15
+
+
+def normalise_seed(seed):
+    """Mask to uint64, mapping 0 onto ZERO_SEED_FALLBACK (see above)."""
+    s = seed & MASK64
+    return s if s else ZERO_SEED_FALLBACK
+
 # (rows, cols, mines) per difficulty, mirroring g_presets[].
 PRESETS = {
     "beginner": (8, 8, 10),
@@ -34,7 +46,7 @@ class Rng64:
     """The game's xorshift64, advanced in place (one value per call)."""
 
     def __init__(self, seed):
-        self.s = seed & MASK64
+        self.s = normalise_seed(seed)
 
     def next(self):
         x = self.s
@@ -82,7 +94,7 @@ class SimBoard:
         self.cols = cols
         self.mines = mines
         self.difficulty = difficulty
-        self.seed = seed & MASK64
+        self.seed = normalise_seed(seed)
         self.rng = Rng64(self.seed)
         n = rows * cols
         self.mine = [False] * n
