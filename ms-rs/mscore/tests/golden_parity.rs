@@ -1,6 +1,6 @@
 //! Bit-exact parity tests against the frozen golden fixtures
-//! (`ms/test/fixtures/golden-{boards,rng,probs}.json`), the same oracles the
-//! Node/Python suites validate against.
+//! (`archive/ms/test/fixtures/golden-{boards,rng,probs}.json`), the same
+//! oracles the Node/Python suites validate against.
 
 use mscore::mt19937::Mt19937;
 use mscore::sim_board::SimBoard;
@@ -11,6 +11,7 @@ fn fixture(name: &str) -> serde_json::Value {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("..");
     p.push("..");
+    p.push("archive");
     p.push("ms");
     p.push("test");
     p.push("fixtures");

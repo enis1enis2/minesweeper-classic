@@ -1,5 +1,6 @@
-//! Deterministic Minesweeper player, ported from `ms/core/solver.js` (itself a
-//! 1:1 port of `minesweeper_bot/ms_solver.py`). Constraint-propagation deduction
+//! Deterministic Minesweeper player, ported from `archive/ms/core/solver.js`
+//! (itself a 1:1 port of `archive/minesweeper_bot/ms_solver.py`).
+//! Constraint-propagation deduction
 //! plus an exact probabilistic pass over the frontier of unrevealed cells.
 //!
 //! The JS port deliberately used insertion-ordered Set/Map for determinism; the
