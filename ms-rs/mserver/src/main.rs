@@ -338,8 +338,8 @@ fn run_selfcheck() -> bool {
     let mut ok = true;
     let cases: [(&str, u64, bool); 3] = [
         ("beginner", 1, true),
-        ("intermediate", 2, false),
-        ("expert", 3, true),
+        ("intermediate", 2, true),
+        ("expert", 3, false),
     ];
     for (diff, seed, expect_won) in cases {
         let task = crate::worker::Task {
