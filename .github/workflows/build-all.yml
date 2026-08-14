@@ -19,7 +19,11 @@ jobs:
         id: msys2
         with:
           msystem: MINGW64
-          update: true
+          # update deliberately NOT set: false (the default) pins package
+          # versions to the MSYS2 installer snapshot, so CI output stays
+          # byte-stable between runs and matches a local install of the same
+          # snapshot. update:true pulled the newest gcc on every run, which
+          # made CI exes silently differ from local ones.
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-binutils
