@@ -15,8 +15,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: main
       - uses: msys2/setup-msys2@v2
         id: msys2
         with:
@@ -109,14 +107,24 @@ jobs:
     needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - name: Assemble release assets
         run: |
+          set -e
           mkdir -p out
           mv dist/* out/
+          # Windows distributable zip: fresh x64/x86 exes + README + LICENSE + checksums.
+          # Name matches the manual release layout, versioned from the tag (v1.0.0 -> 1.0.0).
+          TAG="${GITHUB_REF_NAME#v}"
+          mkdir -p winzip
+          cp out/minesweeper-x64.exe out/minesweeper-x86.exe README.md LICENSE winzip/
+          (cd winzip && sha256sum minesweeper-x64.exe minesweeper-x86.exe README.md LICENSE > SHA256SUMS.txt)
+          (cd winzip && zip -q "../out/Minesweeper-Classic-${TAG}-win32-x64-x86.zip" \
+              minesweeper-x64.exe minesweeper-x86.exe README.md LICENSE SHA256SUMS.txt)
           ls -la out
       - uses: softprops/action-gh-release@v2
         with:
