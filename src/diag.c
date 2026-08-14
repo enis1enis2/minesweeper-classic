@@ -37,8 +37,12 @@
 #define DIAG_CRASH_MAX   2048          /* crash text buffer (filter stack) */
 #define DIAG_STACK_MAX   8             /* stack frames captured at crash   */
 #define DIAG_PAYLOAD_MAX 16384         /* JSON body (thread stack)         */
+#ifndef DIAG_SEND_ATTEMPTS
 #define DIAG_SEND_ATTEMPTS 3           /* bounded retries for transport    */
+#endif
+#ifndef DIAG_RETRY_DELAY_MS
 #define DIAG_RETRY_DELAY_MS 5000       /* pause between retry attempts     */
+#endif
 
 static LONG CALLBACK diag_crash_filter(EXCEPTION_POINTERS *ep);
 
@@ -603,6 +607,7 @@ static int build_payload(char *out, size_t sz) {
  *    0  server answered but not 2xx (endpoint reachable; terminal, no retry)
  *   -1  no HTTP response at all (DNS / connect / TLS / send / receive
  *       failure) -- transient, caller may retry a bounded number of times */
+#ifndef DIAG_TEST_FAKE_POST
 static int http_post_json(const char *host, const char *path,
                           const char *body) {
     WCHAR whost[256], wpath[256];
@@ -651,6 +656,7 @@ done:
     diag_log("diag: delivery failed (no response: DNS/connect/TLS)");
     return -1;
 }
+#endif /* DIAG_TEST_FAKE_POST */
 
 static DWORD WINAPI diag_send_thread(void *arg) {
     char body[DIAG_PAYLOAD_MAX];

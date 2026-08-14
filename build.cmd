@@ -1,8 +1,15 @@
 @echo off
 rem build.cmd - builds both 32-bit and 64-bit releases of Minesweeper (Classic)
-rem Requires MSYS2 with mingw-w64 gcc toolchains. Set MSYS2_ROOT below.
+rem Requires MSYS2 with mingw-w64 gcc toolchains. MSYS2_ROOT comes from the
+rem environment (CI sets it via setup-msys2) or from tools\msys2_root.cmd.
 
-if "%MSYS2_ROOT%"=="" set MSYS2_ROOT=C:\Users\Enis Polat\scoop\apps\msys2\current
+call "%~dp0tools\msys2_root.cmd"
+if not "%MSYS2_ROOT%"=="" goto :have_msys
+echo [ERROR] MSYS2_ROOT is not set and no default MSYS2 install was found.
+echo Set MSYS2_ROOT to your MSYS2 root, then re-run build.cmd.
+echo See tools\msys2_root.cmd for the resolution rules.
+exit /b 1
+:have_msys
 
 set ROOT=%~dp0
 set BUILD=%ROOT%build

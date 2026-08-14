@@ -39,9 +39,5 @@ archive/ms/tools/remote-test.sh
 archive/ms/tools/bench-host.sh
 archive/ms/tools/x11check.sh
 
-# Stale scratch files
-tools/compile_test.cmd
-tools/gcc.log
-
 # Migration scratch probes (not for distribution)
 .migration_ops/

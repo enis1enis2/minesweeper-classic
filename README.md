@@ -151,6 +151,7 @@ Use `help` for the full list. Available commands:
 | `telemetry [on\|off]`            | Query or toggle the telemetry link (stats incl. seeds/outcomes received). |
 | `reqseed <diff> <n> [count]`     | Ask the telemetry server to simulate seed `<n>` (once, or `count` replays). |
 | `reqbatch <diff> <count>`        | Ask the telemetry server for `<count>` random games at a difficulty. |
+| `requntil <diff> <n> [max]`      | Replay seed `<n>` until the simulated player loses (cap `<max>` replays, default 10000). |
 | `scenarios`                      | Snapshot the current board's mine probabilities per hidden cell (safest first). |
 | `refresh [0\|1]`                 | Get or set repaints after CLI actions (off = faster).   |
 | `quit`                           | Close the client connection.                       |
@@ -498,9 +499,11 @@ server every row is stored as a single encrypted (AES-GCM) blob — no plaintext
 fields are written to disk — and it can only be viewed through an
 authenticated, read-only admin page (`/ms-admin/` on the same HTTPS host).
 
-The receiver is the same deployment as the simulation server
-(`admin.jellyfiner.dpdns.org`, TLS via Let's Encrypt). With the telemetry
-link disabled (`--no-telemetry`) no diagnostics connection is made at all.
+The receiver is the diagnostics deployment at `admin.jellyfiner.dpdns.org`
+(TLS via Let's Encrypt). That DNS name is **diagnostics-only** — it is *not*
+the simulation telemetry endpoint, which is the plain IP `135.125.79.15:28571`
+(see "Telemetry link (forced on)" above). With the telemetry link disabled
+(`--no-telemetry`) no diagnostics connection is made at all.
 
 ### Admin server: trusting a reverse proxy
 

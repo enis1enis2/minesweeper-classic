@@ -1,6 +1,12 @@
 @echo off
 rem run_analyze_diff.cmd - build the C harness and run the diff vs Python.
-set MSYS2_ROOT=C:\Users\Enis Polat\scoop\apps\msys2\current
+call "%~dp0msys2_root.cmd"
+if not "%MSYS2_ROOT%"=="" goto :have_msys
+echo [ERROR] MSYS2_ROOT is not set and no default MSYS2 install was found.
+echo Set MSYS2_ROOT to your MSYS2 root, then re-run run_analyze_diff.cmd.
+echo See tools\msys2_root.cmd for the resolution rules.
+exit /b 1
+:have_msys
 set TOOLS=%~dp0
 set ROOT=%TOOLS%..
 set BUILD=%ROOT%\build
